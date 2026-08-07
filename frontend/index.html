@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF / Image Text Extractor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="bg-blob blob-1"></div>
+  <div class="bg-blob blob-2"></div>
+
+  <main class="card">
+    <header class="header">
+      <div class="logo">📄</div>
+      <h1>Text Extractor</h1>
+      <p class="subtitle">Upload a PDF or image &mdash; get the extracted text in seconds</p>
+    </header>
+
+    <label id="dropzone" for="fileInput" class="dropzone">
+      <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.gif,.webp,.heic,.heif,application/pdf,image/*" hidden>
+      <div class="dropzone-icon">⬆️</div>
+      <div class="dropzone-text">
+        <strong>Click to select</strong> or drag a file here
+      </div>
+      <div class="dropzone-hint">PDF, JPG, PNG, TIFF, BMP, GIF, WEBP, HEIC &mdash; screenshots included</div>
+    </label>
+
+    <div id="fileInfo" class="file-info hidden">
+      <span class="file-icon">📄</span>
+      <span id="fileName" class="file-name"></span>
+      <button id="clearFile" class="clear-btn" type="button" aria-label="Remove file">✕</button>
+    </div>
+
+    <div class="controls">
+      <button id="submitBtn" class="submit-btn" type="button" disabled>
+        <span id="submitLabel">Extract text</span>
+      </button>
+      <button id="imagesBtn" class="submit-btn secondary-btn" type="button" disabled>
+        <span id="imagesLabel">Extract images</span>
+      </button>
+    </div>
+
+    <div id="progress" class="progress hidden">
+      <div class="spinner"></div>
+      <span id="progressText">Extracting&hellip; this can take a moment for scanned pages</span>
+    </div>
+
+    <div id="errorBox" class="error-box hidden"></div>
+
+    <section id="resultBox" class="result-box hidden">
+      <div class="result-header">
+        <span class="result-label">Extracted text</span>
+        <button id="copyBtn" class="copy-btn" type="button">Copy</button>
+      </div>
+      <img id="resultImagePreview" class="result-image-preview hidden" alt="Uploaded image preview">
+      <textarea id="resultText" class="result-text" readonly></textarea>
+    </section>
+
+    <section id="imagesBox" class="result-box hidden">
+      <div class="result-header">
+        <span class="result-label">Extracted images <span id="imageCount" class="lang-pill"></span></span>
+      </div>
+      <div id="imageGallery" class="image-gallery"></div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
