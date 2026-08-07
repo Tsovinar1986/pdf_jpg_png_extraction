@@ -13,12 +13,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from extractor import (
-    IMAGE_EXTS,
-    extract_images_from_file,
-    extract_text_from_image,
-    extract_text_from_pdf,
-)
+from extractor import ALL_SUPPORTED_EXTS, extract_images_from_file, extract_text_from_path
 
 app = FastAPI(title="PDF/Image Text Extraction Service")
 
@@ -27,7 +22,7 @@ FRONTEND_DIR = ROOT_DIR / "frontend"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
-SUPPORTED_EXTS = IMAGE_EXTS | {".pdf"}
+SUPPORTED_EXTS = ALL_SUPPORTED_EXTS
 
 
 class ExtractionResponse(BaseModel):
@@ -77,10 +72,7 @@ def health():
 async def extract_text(file: UploadFile = File(...)):
     async with _save_upload_to_temp(file) as tmp_path:
         try:
-            if tmp_path.suffix == ".pdf":
-                text = extract_text_from_pdf(tmp_path)
-            else:
-                text = extract_text_from_image(tmp_path)
+            text = extract_text_from_path(tmp_path)
         except HTTPException:
             raise
         except Exception as exc:

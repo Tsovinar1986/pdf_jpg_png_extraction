@@ -11,7 +11,9 @@ Features:
 """
 import argparse
 import io
+import os
 import sys
+import zipfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -40,8 +42,22 @@ try:
 except Exception:
     pymupdf = None
 
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
+
+try:
+    import docx as python_docx
+except Exception:
+    python_docx = None
+
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+TEXT_EXTS = {".txt", ".csv"}
+SPREADSHEET_EXTS = {".xlsx", ".xlsm"}
+DOCX_EXTS = {".docx"}
+OFFICE_ZIP_EXTS = SPREADSHEET_EXTS | DOCX_EXTS
 
 try:
     # Adds HEIC/HEIF decoding support to Pillow (common iOS/macOS screenshot
@@ -53,8 +69,13 @@ try:
 except Exception:
     pass
 
+# Tesseract language packs to run together (Armenian docs are often mixed
+# with Russian/English headers and stamps, like the NAIRI medical reports).
+# Override with the OCR_LANGS env var, e.g. "eng" for Latin-only scans.
+DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
 
-def extract_text_from_pdf(path: Path) -> str:
+
+def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # First try to extract text directly (for digitally generated PDFs)
     if pdf_extract_text is not None:
         try:
@@ -71,13 +92,13 @@ def extract_text_from_pdf(path: Path) -> str:
     pages = convert_from_path(str(path))
     out_lines = []
     for i, page in enumerate(pages, start=1):
-        txt = pytesseract.image_to_string(page)
+        txt = pytesseract.image_to_string(page, lang=lang)
         out_lines.append(f"\n--- PAGE {i} ---\n")
         out_lines.append(txt)
     return "\n".join(out_lines)
 
 
-def extract_text_from_image(path: Path) -> str:
+def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     if pytesseract is None or Image is None:
         raise RuntimeError("Missing image OCR dependencies: install pytesseract and pillow")
     img = Image.open(path)
@@ -85,7 +106,45 @@ def extract_text_from_image(path: Path) -> str:
     # BMP, ...); formats like HEIF/WEBP fall outside that list and get
     # rejected, so force it to re-encode as PNG instead.
     img.format = None
-    return pytesseract.image_to_string(img)
+    return pytesseract.image_to_string(img, lang=lang)
+
+
+def extract_text_from_textfile(path: Path) -> str:
+    # Text/CSV files already are text — read them as-is rather than OCR-ing.
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
+def extract_text_from_spreadsheet(path: Path) -> str:
+    if openpyxl is None:
+        raise RuntimeError("Missing spreadsheet dependency: install openpyxl")
+    wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+    out_lines = []
+    try:
+        for ws in wb.worksheets:
+            out_lines.append(f"\n--- SHEET: {ws.title} ---\n")
+            for row in ws.iter_rows(values_only=True):
+                cells = ["" if c is None else str(c) for c in row]
+                if any(cells):
+                    out_lines.append("\t".join(cells))
+    finally:
+        wb.close()
+    return "\n".join(out_lines)
+
+
+def extract_text_from_docx(path: Path) -> str:
+    if python_docx is None:
+        raise RuntimeError("Missing docx dependency: install python-docx")
+    document = python_docx.Document(str(path))
+    parts = [p.text for p in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            parts.append("\t".join(cell.text for cell in row.cells))
+    return "\n".join(parts)
 
 
 def _to_png_bytes(img: "Image.Image") -> bytes:
@@ -132,6 +191,23 @@ def extract_images_from_pdf(path: Path) -> List[bytes]:
     return images
 
 
+def extract_images_from_office(path: Path) -> List[bytes]:
+    """xlsx/docx are zip archives; pull out whatever pictures are embedded
+    under their media/ folder."""
+    images: List[bytes] = []
+    with zipfile.ZipFile(path) as z:
+        for name in sorted(n for n in z.namelist() if "/media/" in n):
+            raw = z.read(name)
+            if Image is not None:
+                try:
+                    images.append(_to_png_bytes(Image.open(io.BytesIO(raw))))
+                    continue
+                except Exception:
+                    pass
+            images.append(raw)
+    return images
+
+
 def extract_images_from_file(path: Path) -> List[bytes]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
@@ -140,7 +216,29 @@ def extract_images_from_file(path: Path) -> List[bytes]:
         if Image is None:
             raise RuntimeError("Missing image dependency: install pillow")
         return [_to_png_bytes(Image.open(path))]
+    if suffix in OFFICE_ZIP_EXTS:
+        return extract_images_from_office(path)
+    if suffix in TEXT_EXTS:
+        return []
     raise ValueError(f"Unsupported file type: {suffix}")
+
+
+ALL_SUPPORTED_EXTS = IMAGE_EXTS | TEXT_EXTS | SPREADSHEET_EXTS | DOCX_EXTS | {".pdf"}
+
+
+def extract_text_from_path(p: Path) -> Optional[str]:
+    suffix = p.suffix.lower()
+    if suffix == ".pdf":
+        return extract_text_from_pdf(p)
+    if suffix in IMAGE_EXTS:
+        return extract_text_from_image(p)
+    if suffix in TEXT_EXTS:
+        return extract_text_from_textfile(p)
+    if suffix in SPREADSHEET_EXTS:
+        return extract_text_from_spreadsheet(p)
+    if suffix in DOCX_EXTS:
+        return extract_text_from_docx(p)
+    return None
 
 
 def process_path(p: Path) -> Optional[str]:
@@ -151,7 +249,7 @@ def process_path(p: Path) -> Optional[str]:
     if p.is_dir():
         outputs = []
         for f in sorted(p.rglob("*")):
-            if f.is_file() and (f.suffix.lower() in IMAGE_EXTS or f.suffix.lower() == ".pdf"):
+            if f.is_file() and f.suffix.lower() in ALL_SUPPORTED_EXTS:
                 txt = process_path(f)
                 if txt:
                     outputs.append(f"\n===== {f} =====\n")
@@ -159,10 +257,8 @@ def process_path(p: Path) -> Optional[str]:
         return "\n".join(outputs)
 
     # single file
-    if p.suffix.lower() == ".pdf":
-        return extract_text_from_pdf(p)
-    if p.suffix.lower() in IMAGE_EXTS:
-        return extract_text_from_image(p)
+    if p.suffix.lower() in ALL_SUPPORTED_EXTS:
+        return extract_text_from_path(p)
 
     print(f"Unsupported file type: {p}", file=sys.stderr)
     return None

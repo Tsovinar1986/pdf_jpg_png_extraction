@@ -6,8 +6,9 @@ Extract text from PDFs and common image formats (including screenshots), with OC
 Features
 --------
 - PDF text extraction via `pdfminer.six`, with OCR fallback (`pdf2image` + `pytesseract`) for scanned/image-only PDFs.
-- Image OCR for PNG, JPG/JPEG, TIFF, BMP, GIF, WEBP, and HEIC/HEIF (iOS/macOS screenshot format).
-- Extract embedded images out of a PDF, or the image itself for a plain image upload, as downloadable PNGs.
+- Image OCR for PNG, JPG/JPEG, TIFF, BMP, GIF, WEBP, and HEIC/HEIF (iOS/macOS screenshot format), recognizing Armenian, Russian, and English by default (`OCR_LANGS` env var to change).
+- XLSX/XLSM, DOCX, CSV, and TXT are read directly (not OCR'd) — spreadsheets are converted to tab-separated text per sheet, DOCX paragraphs/tables are read as-is.
+- Extract embedded images out of a PDF/XLSX/DOCX, or the image itself for a plain image upload, as downloadable PNGs.
 - Web UI (FastAPI backend + static frontend) with drag-and-drop upload, extracted-text panel, and an image gallery.
 
 Installation
@@ -46,6 +47,7 @@ Notes
 -----
 - For best OCR results ensure `tesseract` is installed and on PATH.
 - `pdf2image` requires `poppler` (installed via Homebrew on macOS).
+- OCR defaults to Armenian + Russian + English (`hye+rus+eng`). Install the language packs if missing: `brew install tesseract-lang`, or check what's available with `tesseract --list-langs`.
 
 Web app (upload UI + API)
 --------------------------
