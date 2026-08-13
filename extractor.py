@@ -12,6 +12,7 @@ Features:
 import argparse
 import io
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -105,22 +106,68 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     return ImageOps.autocontrast(ImageOps.grayscale(img))
 
 
+_WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+
 def _ocr_score(text: str) -> int:
-    return sum(1 for c in text if c.isalnum())
+    # Counting raw alnum characters lets noise win: busy illustrations can
+    # OCR into long runs of junk symbols/short fragments that outscore a
+    # short-but-correct reading. Score by letters inside word-like runs of
+    # 3+ characters instead — garbage rarely forms those consistently.
+    return sum(len(w) for w in _WORD_RE.findall(text))
+
+
+def _otsu_threshold(gray_img: "Image.Image") -> int:
+    hist = gray_img.histogram()
+    total = sum(hist)
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    sum_bg = 0.0
+    weight_bg = 0
+    best_variance = 0.0
+    threshold = 127
+    for i, h in enumerate(hist):
+        weight_bg += h
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += i * h
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_all - sum_bg) / weight_fg
+        variance = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if variance > best_variance:
+            best_variance = variance
+            threshold = i
+    return threshold
 
 
 def _ocr_best_of(img: "Image.Image", lang: str) -> str:
-    """Run OCR on the image and its color-inverted counterpart, keeping
-    whichever recognized more actual characters.
+    """Run OCR against a few different renderings of the same (grayscale)
+    image and keep whichever recognized the most real words.
 
-    Tesseract is tuned for dark text on a light background; light text on
-    a dark background (posters, dark-mode screenshots, chat bubbles) can
-    silently OCR to nothing even after contrast correction, and there's no
-    reliable way to tell in advance which polarity will work.
+    Tesseract is tuned for solid dark text on a light background. Posters,
+    dark-mode screenshots, and images with busy illustrated backgrounds
+    can confuse its thresholding badly enough that a plain grayscale pass
+    reads nothing, or hallucinates junk from the artwork. Trying the
+    original, its color inversion, and a binarized (pure black/white,
+    Otsu-thresholded) version of both covers the common failure modes
+    without having to guess which one applies ahead of time.
     """
-    normal = pytesseract.image_to_string(img, lang=lang)
-    inverted = pytesseract.image_to_string(ImageOps.invert(img), lang=lang)
-    return normal if _ocr_score(normal) >= _ocr_score(inverted) else inverted
+    threshold = _otsu_threshold(img)
+    binarized = img.point(lambda p: 255 if p > threshold else 0)
+    candidates = [img, ImageOps.invert(img), binarized, ImageOps.invert(binarized)]
+
+    best_text, best_score = "", -1
+    for candidate in candidates:
+        try:
+            text = pytesseract.image_to_string(candidate, lang=lang)
+        except Exception:
+            continue
+        score = _ocr_score(text)
+        if score > best_score:
+            best_text, best_score = text, score
+    return best_text
 
 
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:

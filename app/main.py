@@ -120,4 +120,15 @@ async def download_text(text: str = Form(...), filename: str = Form("extracted-t
     )
 
 
-app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+class NoCacheStaticFiles(StaticFiles):
+    """Force revalidation on every request so frontend edits (HTML/CSS/JS)
+    show up on a normal reload instead of needing a hard-refresh to bust
+    the browser's cache."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/", NoCacheStaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
