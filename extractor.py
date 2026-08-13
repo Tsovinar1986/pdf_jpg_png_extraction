@@ -28,9 +28,10 @@ except Exception:
     convert_from_path = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except Exception:
     Image = None
+    ImageOps = None
 
 try:
     import pytesseract
@@ -90,6 +91,20 @@ DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
 
 
+def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
+    """Upscale small images and boost contrast before OCR.
+
+    Tesseract's layout analysis and character recognition are unreliable
+    on the low-resolution, low-contrast images typical of screenshots
+    (e.g. small white text on a colored chat-bubble background) — it can
+    silently drop whole text blocks rather than misread them.
+    """
+    img = img.convert("RGB")
+    if max(img.size) < 2000:
+        img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    return ImageOps.autocontrast(ImageOps.grayscale(img))
+
+
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # First try to extract text directly (for digitally generated PDFs)
     if pdf_extract_text is not None:
@@ -107,7 +122,7 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     pages = convert_from_path(str(path), poppler_path=POPPLER_PATH)
     out_lines = []
     for i, page in enumerate(pages, start=1):
-        txt = pytesseract.image_to_string(page, lang=lang)
+        txt = pytesseract.image_to_string(_preprocess_for_ocr(page), lang=lang)
         out_lines.append(f"\n--- PAGE {i} ---\n")
         out_lines.append(txt)
     return "\n".join(out_lines)
@@ -120,11 +135,7 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # Windows, where the caller's temp-file cleanup would otherwise fail
     # with "file in use by another process".
     with Image.open(path) as img:
-        # pytesseract only recognizes a handful of PIL format tags (PNG,
-        # JPEG, BMP, ...); formats like HEIF/WEBP fall outside that list and
-        # get rejected, so force it to re-encode as PNG instead.
-        img.format = None
-        return pytesseract.image_to_string(img, lang=lang)
+        return pytesseract.image_to_string(_preprocess_for_ocr(img), lang=lang)
 
 
 def extract_text_from_textfile(path: Path) -> str:
