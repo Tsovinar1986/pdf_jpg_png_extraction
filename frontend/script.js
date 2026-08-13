@@ -16,6 +16,9 @@ const resultText = document.getElementById("resultText");
 const resultImagePreview = document.getElementById("resultImagePreview");
 const copyBtn = document.getElementById("copyBtn");
 const downloadBtn = document.getElementById("downloadBtn");
+const downloadForm = document.getElementById("downloadForm");
+const downloadTextInput = document.getElementById("downloadTextInput");
+const downloadFilenameInput = document.getElementById("downloadFilenameInput");
 
 const IMAGE_EXTS = new Set([
   ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp", ".heic", ".heif",
@@ -253,16 +256,10 @@ copyBtn.addEventListener("click", async () => {
 
 downloadBtn.addEventListener("click", () => {
   if (!resultText.value) return;
-  const dot = lastResultFilename.lastIndexOf(".");
-  const stem = dot > 0 ? lastResultFilename.slice(0, dot) : lastResultFilename || "extracted-text";
-
-  const blob = new Blob([resultText.value], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${stem}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  // Submitted as a real form POST (not a scripted click on a blob: <a>)
+  // so the download works consistently across browsers, including
+  // Safari/WebKit, which doesn't reliably honor scripted blob downloads.
+  downloadTextInput.value = resultText.value;
+  downloadFilenameInput.value = lastResultFilename || "extracted-text.txt";
+  downloadForm.submit();
 });

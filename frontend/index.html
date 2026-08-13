@@ -73,6 +73,12 @@
     </section>
   </main>
 
+  <form id="downloadForm" action="/api/download-text" method="POST" target="downloadFrame" hidden>
+    <input type="hidden" name="text" id="downloadTextInput">
+    <input type="hidden" name="filename" id="downloadFilenameInput">
+  </form>
+  <iframe name="downloadFrame" hidden></iframe>
+
   <script src="script.js"></script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 import base64
 import contextlib
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -9,7 +10,8 @@ from typing import Iterator, List
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -100,6 +102,22 @@ async def extract_images(file: UploadFile = File(...)):
         for i, data in enumerate(images)
     ]
     return ImageExtractionResponse(images=payload, filename=file.filename or "")
+
+
+def _safe_download_filename(name: str) -> str:
+    stem = Path(name or "extracted-text").stem or "extracted-text"
+    stem = re.sub(r'[\r\n"/\\]+', "_", stem)
+    return f"{stem}.txt"
+
+
+@app.post("/api/download-text")
+async def download_text(text: str = Form(...), filename: str = Form("extracted-text.txt")):
+    safe_name = _safe_download_filename(filename)
+    return PlainTextResponse(
+        text,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
 
 
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
