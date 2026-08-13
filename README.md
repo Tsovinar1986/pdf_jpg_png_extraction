@@ -14,17 +14,49 @@ Features
 Installation
 ------------
 
-1. Install system dependencies (macOS):
+1. Install system dependencies (Tesseract for OCR, Poppler for PDF rendering):
+
+**macOS**
 
 ```sh
 brew install tesseract poppler
+brew install tesseract-lang   # Armenian/Russian language packs
 ```
+
+**Linux (Debian/Ubuntu)**
+
+```sh
+sudo apt-get install tesseract-ocr tesseract-ocr-hye tesseract-ocr-rus poppler-utils
+```
+
+**Windows**
+
+- Install Tesseract from the [UB Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki) (includes an option to add extra language packs during setup).
+- Install Poppler for Windows from [oschwartz10612/poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases).
+- Either add both tools' folders to your `PATH`, or point the app at them directly with environment variables (no PATH changes needed):
+
+  ```powershell
+  setx TESSERACT_CMD "C:\Program Files\Tesseract-OCR\tesseract.exe"
+  setx POPPLER_PATH "C:\poppler\Library\bin"
+  ```
+
+  (If Tesseract was installed to its default location, `TESSERACT_CMD` is auto-detected and can be skipped.)
 
 2. Install Python dependencies (prefer a virtualenv):
 
+**macOS/Linux**
+
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Windows (PowerShell)**
+
+```powershell
+py -m venv venv
+venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 

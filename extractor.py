@@ -37,6 +37,17 @@ try:
 except Exception:
     pytesseract = None
 
+if pytesseract is not None:
+    _tesseract_cmd = os.getenv("TESSERACT_CMD")
+    if _tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
+    elif sys.platform == "win32":
+        # The Windows installer doesn't add tesseract.exe to PATH by
+        # default; fall back to its default install location if present.
+        _default_tesseract = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Tesseract-OCR" / "tesseract.exe"
+        if _default_tesseract.exists():
+            pytesseract.pytesseract.tesseract_cmd = str(_default_tesseract)
+
 try:
     import pymupdf
 except Exception:
@@ -74,6 +85,10 @@ except Exception:
 # Override with the OCR_LANGS env var, e.g. "eng" for Latin-only scans.
 DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
 
+# On Windows, poppler (pdftoppm/pdftocairo) usually isn't on PATH unless
+# manually added; point pdf2image at its bin/ folder via this env var.
+POPPLER_PATH = os.getenv("POPPLER_PATH") or None
+
 
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # First try to extract text directly (for digitally generated PDFs)
@@ -89,7 +104,7 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     if convert_from_path is None or pytesseract is None or Image is None:
         raise RuntimeError("Missing pdf->image OCR dependencies: install pdf2image, pytesseract, pillow")
 
-    pages = convert_from_path(str(path))
+    pages = convert_from_path(str(path), poppler_path=POPPLER_PATH)
     out_lines = []
     for i, page in enumerate(pages, start=1):
         txt = pytesseract.image_to_string(page, lang=lang)
@@ -101,12 +116,15 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
 def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     if pytesseract is None or Image is None:
         raise RuntimeError("Missing image OCR dependencies: install pytesseract and pillow")
-    img = Image.open(path)
-    # pytesseract only recognizes a handful of PIL format tags (PNG, JPEG,
-    # BMP, ...); formats like HEIF/WEBP fall outside that list and get
-    # rejected, so force it to re-encode as PNG instead.
-    img.format = None
-    return pytesseract.image_to_string(img, lang=lang)
+    # Closing the handle (rather than leaving it open until GC) matters on
+    # Windows, where the caller's temp-file cleanup would otherwise fail
+    # with "file in use by another process".
+    with Image.open(path) as img:
+        # pytesseract only recognizes a handful of PIL format tags (PNG,
+        # JPEG, BMP, ...); formats like HEIF/WEBP fall outside that list and
+        # get rejected, so force it to re-encode as PNG instead.
+        img.format = None
+        return pytesseract.image_to_string(img, lang=lang)
 
 
 def extract_text_from_textfile(path: Path) -> str:
@@ -183,7 +201,7 @@ def extract_images_from_pdf(path: Path) -> List[bytes]:
                     continue
 
         if not images and convert_from_path is not None:
-            for page in convert_from_path(str(path)):
+            for page in convert_from_path(str(path), poppler_path=POPPLER_PATH):
                 images.append(_to_png_bytes(page))
     finally:
         doc.close()
@@ -215,7 +233,8 @@ def extract_images_from_file(path: Path) -> List[bytes]:
     if suffix in IMAGE_EXTS:
         if Image is None:
             raise RuntimeError("Missing image dependency: install pillow")
-        return [_to_png_bytes(Image.open(path))]
+        with Image.open(path) as img:
+            return [_to_png_bytes(img)]
     if suffix in OFFICE_ZIP_EXTS:
         return extract_images_from_office(path)
     if suffix in TEXT_EXTS:
