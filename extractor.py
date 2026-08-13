@@ -105,6 +105,24 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     return ImageOps.autocontrast(ImageOps.grayscale(img))
 
 
+def _ocr_score(text: str) -> int:
+    return sum(1 for c in text if c.isalnum())
+
+
+def _ocr_best_of(img: "Image.Image", lang: str) -> str:
+    """Run OCR on the image and its color-inverted counterpart, keeping
+    whichever recognized more actual characters.
+
+    Tesseract is tuned for dark text on a light background; light text on
+    a dark background (posters, dark-mode screenshots, chat bubbles) can
+    silently OCR to nothing even after contrast correction, and there's no
+    reliable way to tell in advance which polarity will work.
+    """
+    normal = pytesseract.image_to_string(img, lang=lang)
+    inverted = pytesseract.image_to_string(ImageOps.invert(img), lang=lang)
+    return normal if _ocr_score(normal) >= _ocr_score(inverted) else inverted
+
+
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # First try to extract text directly (for digitally generated PDFs)
     if pdf_extract_text is not None:
@@ -135,7 +153,7 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # Windows, where the caller's temp-file cleanup would otherwise fail
     # with "file in use by another process".
     with Image.open(path) as img:
-        return pytesseract.image_to_string(_preprocess_for_ocr(img), lang=lang)
+        return _ocr_best_of(_preprocess_for_ocr(img), lang)
 
 
 def extract_text_from_textfile(path: Path) -> str:

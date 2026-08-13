@@ -9,11 +9,13 @@ const imagesBtn = document.getElementById("imagesBtn");
 const imagesLabel = document.getElementById("imagesLabel");
 const progress = document.getElementById("progress");
 const progressText = document.getElementById("progressText");
+const progressBarFill = document.getElementById("progressBarFill");
 const errorBox = document.getElementById("errorBox");
 const resultBox = document.getElementById("resultBox");
 const resultText = document.getElementById("resultText");
 const resultImagePreview = document.getElementById("resultImagePreview");
 const copyBtn = document.getElementById("copyBtn");
+const downloadBtn = document.getElementById("downloadBtn");
 
 const IMAGE_EXTS = new Set([
   ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp", ".heic", ".heif",
@@ -109,12 +111,49 @@ function setLoading(isLoading, mode) {
   submitLabel.textContent = isLoading && mode === "text" ? "Extracting..." : "Extract text";
   imagesLabel.textContent = isLoading && mode === "images" ? "Extracting..." : "Extract images";
   if (isLoading) {
-    progressText.textContent =
-      mode === "images"
-        ? "Pulling images out… this can take a moment for large PDFs"
-        : "Extracting… this can take a moment for scanned pages";
+    setUploadProgress(0);
   }
 }
+
+function setUploadProgress(fraction) {
+  const pct = Math.round(fraction * 100);
+  progressBarFill.classList.remove("indeterminate");
+  progressBarFill.style.width = `${pct}%`;
+  progressText.textContent = `Uploading… ${pct}%`;
+}
+
+function setProcessing(mode) {
+  progressBarFill.classList.add("indeterminate");
+  progressText.textContent =
+    mode === "images"
+      ? "Pulling images out… this can take a moment for large PDFs"
+      : "Extracting… this can take a moment for scanned pages";
+}
+
+function uploadFile(url, file, onUploadProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "json";
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) onUploadProgress(e.loaded / e.total);
+    });
+    xhr.addEventListener("load", () => {
+      const body = xhr.response || {};
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body);
+      } else {
+        reject(new Error(body.detail || `Error (${xhr.status})`));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("Network error")));
+    const formData = new FormData();
+    formData.append("file", file);
+    xhr.send(formData);
+  });
+}
+
+let lastResultFilename = "";
 
 submitBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
@@ -123,22 +162,16 @@ submitBtn.addEventListener("click", async () => {
   resultBox.classList.add("hidden");
   setLoading(true, "text");
 
-  const formData = new FormData();
-  formData.append("file", selectedFile);
-
   try {
-    const response = await fetch("/api/extract-text", {
-      method: "POST",
-      body: formData,
+    const data = await uploadFile("/api/extract-text", selectedFile, (fraction) => {
+      if (fraction >= 1) {
+        setProcessing("text");
+      } else {
+        setUploadProgress(fraction);
+      }
     });
-
-    if (!response.ok) {
-      const errBody = await response.json().catch(() => ({}));
-      throw new Error(errBody.detail || `Error (${response.status})`);
-    }
-
-    const data = await response.json();
     resultText.value = data.text || "";
+    lastResultFilename = data.filename || selectedFile.name;
 
     clearPreview();
     if (isImageFile(selectedFile)) {
@@ -166,21 +199,14 @@ imagesBtn.addEventListener("click", async () => {
   imageGallery.innerHTML = "";
   setLoading(true, "images");
 
-  const formData = new FormData();
-  formData.append("file", selectedFile);
-
   try {
-    const response = await fetch("/api/extract-images", {
-      method: "POST",
-      body: formData,
+    const data = await uploadFile("/api/extract-images", selectedFile, (fraction) => {
+      if (fraction >= 1) {
+        setProcessing("images");
+      } else {
+        setUploadProgress(fraction);
+      }
     });
-
-    if (!response.ok) {
-      const errBody = await response.json().catch(() => ({}));
-      throw new Error(errBody.detail || `Error (${response.status})`);
-    }
-
-    const data = await response.json();
     const images = data.images || [];
     imageCount.textContent = String(images.length);
     images.forEach((img) => {
@@ -223,4 +249,20 @@ copyBtn.addEventListener("click", async () => {
     resultText.select();
     document.execCommand("copy");
   }
+});
+
+downloadBtn.addEventListener("click", () => {
+  if (!resultText.value) return;
+  const dot = lastResultFilename.lastIndexOf(".");
+  const stem = dot > 0 ? lastResultFilename.slice(0, dot) : lastResultFilename || "extracted-text";
+
+  const blob = new Blob([resultText.value], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${stem}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 });

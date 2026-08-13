@@ -42,8 +42,13 @@
     </div>
 
     <div id="progress" class="progress hidden">
-      <div class="spinner"></div>
-      <span id="progressText">Extracting&hellip; this can take a moment for scanned pages</span>
+      <div class="progress-bar-track">
+        <div id="progressBarFill" class="progress-bar-fill"></div>
+      </div>
+      <div class="progress-status">
+        <div class="spinner"></div>
+        <span id="progressText">Extracting&hellip; this can take a moment for scanned pages</span>
+      </div>
     </div>
 
     <div id="errorBox" class="error-box hidden"></div>
@@ -51,7 +56,10 @@
     <section id="resultBox" class="result-box hidden">
       <div class="result-header">
         <span class="result-label">Extracted text</span>
-        <button id="copyBtn" class="copy-btn" type="button">Copy</button>
+        <div class="result-actions">
+          <button id="downloadBtn" class="copy-btn" type="button">Download</button>
+          <button id="copyBtn" class="copy-btn" type="button">Copy</button>
+        </div>
       </div>
       <img id="resultImagePreview" class="result-image-preview hidden" alt="Uploaded image preview">
       <textarea id="resultText" class="result-text" readonly></textarea>
