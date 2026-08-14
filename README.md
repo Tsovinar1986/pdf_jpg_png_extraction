@@ -31,7 +31,7 @@ sudo apt-get install tesseract-ocr tesseract-ocr-hye tesseract-ocr-rus poppler-u
 
 **Windows**
 
-- Install Tesseract from the [UB Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki) (includes an option to add extra language packs during setup).
+- Install Tesseract from the [UB Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki). **During setup, expand "Additional language data" and check Armenian and Russian** (`hye`, `rus`) — they're not installed by default, only English is. This step is easy to miss; if you already installed without it, rerun the installer and check "Modify" to add them.
 - Install Poppler for Windows from [oschwartz10612/poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases).
 - Either add both tools' folders to your `PATH`, or point the app at them directly with environment variables (no PATH changes needed):
 
@@ -41,6 +41,14 @@ sudo apt-get install tesseract-ocr tesseract-ocr-hye tesseract-ocr-rus poppler-u
   ```
 
   (If Tesseract was installed to its default location, `TESSERACT_CMD` is auto-detected and can be skipped.)
+
+- To check which languages are actually installed:
+
+  ```powershell
+  & "C:\Program Files\Tesseract-OCR\tesseract.exe" --list-langs
+  ```
+
+  If a language the app needs (`OCR_LANGS`, default `hye+rus+eng`) isn't listed, extraction now fails with a clear error naming exactly what's missing, instead of silently misreading that script as English/Cyrillic gibberish.
 
 2. Install Python dependencies (prefer a virtualenv):
 

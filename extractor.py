@@ -92,6 +92,59 @@ DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
 
 
+def _installed_ocr_langs() -> Optional[set]:
+    if pytesseract is None:
+        return None
+    try:
+        return set(pytesseract.get_languages(config=""))
+    except Exception:
+        return None
+
+
+def _resolve_ocr_langs(lang: str) -> str:
+    """Validate the '+'-joined language codes against what Tesseract
+    actually has trained data for.
+
+    A missing language pack (most commonly Armenian on Windows, where the
+    installer's language checkboxes are easy to miss) doesn't reliably
+    make tesseract error out — depending on the build, it can silently OCR
+    the script using only the languages it does have, misreading Armenian
+    letter shapes as vaguely similar Latin/Cyrillic ones and returning
+    fluent-looking but meaningless gibberish instead of failing. Checking
+    up front turns that into a clear, actionable error.
+    """
+    requested = [code for code in lang.split("+") if code]
+    installed = _installed_ocr_langs()
+    if not installed:
+        # get_languages() itself failed (e.g. tesseract not found at all);
+        # let the OCR call raise its own, more specific error.
+        return lang
+
+    missing = [code for code in requested if code not in installed]
+    if not missing:
+        return lang
+
+    usable = [code for code in requested if code in installed]
+    fix_hint = (
+        "Install the missing Tesseract language data (see the README's per-OS "
+        "instructions — on Windows, rerun the Tesseract installer and check the "
+        "language you need)"
+    )
+    if not usable:
+        raise RuntimeError(
+            f"None of the requested OCR languages ({'+'.join(requested)}) are installed "
+            f"in Tesseract ({len(installed)} other language(s) found). {fix_hint}, "
+            "or set OCR_LANGS to a language you do have installed."
+        )
+
+    raise RuntimeError(
+        f"Missing Tesseract language data for: {', '.join(missing)}. OCR would silently "
+        "misread that script using only the installed languages instead of failing "
+        f"clearly, so refusing to run. {fix_hint}, or set OCR_LANGS={'+'.join(usable)} "
+        "to proceed with only what's installed."
+    )
+
+
 def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     """Upscale small images and boost contrast before OCR.
 
@@ -184,6 +237,7 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     if convert_from_path is None or pytesseract is None or Image is None:
         raise RuntimeError("Missing pdf->image OCR dependencies: install pdf2image, pytesseract, pillow")
 
+    lang = _resolve_ocr_langs(lang)
     pages = convert_from_path(str(path), poppler_path=POPPLER_PATH)
     out_lines = []
     for i, page in enumerate(pages, start=1):
@@ -199,6 +253,7 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # Closing the handle (rather than leaving it open until GC) matters on
     # Windows, where the caller's temp-file cleanup would otherwise fail
     # with "file in use by another process".
+    lang = _resolve_ocr_langs(lang)
     with Image.open(path) as img:
         return _ocr_best_of(_preprocess_for_ocr(img), lang)
 
