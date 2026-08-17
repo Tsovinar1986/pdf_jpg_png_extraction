@@ -1,16 +1,28 @@
 # These are Python packages only — pip can't install Tesseract itself or
-# its language data (needed for OCR_LANGS, default "hye+rus+eng"). Install
-# those at the OS level first:
+# its language data (needed for OCR_LANGS, default "hye-calfa-n+rus+eng").
+# Install those at the OS level first:
 #   macOS:           brew install tesseract poppler
-#                     brew install tesseract-lang   # adds Armenian/Russian/etc.
+#                     brew install tesseract-lang   # adds Russian/etc.
 #   Ubuntu/Debian:    sudo apt-get install tesseract-ocr poppler-utils
-#                     sudo apt install tesseract-ocr-hye tesseract-ocr-rus
-#   Windows:          install Tesseract from the UB Mannheim build and check
-#                     "Additional language data" (Armenian/Russian) during
-#                     setup — or, if you already installed without it,
-#                     download hye.traineddata / rus.traineddata from
-#                     https://github.com/tesseract-ocr/tessdata and drop
-#                     them into Tesseract-OCR/tessdata.
+#                     sudo apt install tesseract-ocr-rus
+#   Windows:          install Tesseract from the UB Mannheim build, and
+#                     Poppler for Windows separately.
+#
+# Armenian ("hye-calfa-n") isn't packaged by brew/apt/the Windows
+# installer — it's a community model (trained on Classical, Western, AND
+# Eastern Armenian, unlike Tesseract's own "hye" which only covers
+# Eastern Armenian orthography). Install it manually on every OS:
+#   1. Download hye-calfa-n.traineddata from
+#      https://github.com/calfa-co/hye-tesseract
+#   2. Place it in Tesseract's tessdata folder, next to hye.traineddata:
+#        macOS (Homebrew):     /opt/homebrew/share/tessdata/
+#        Ubuntu/Debian:        /usr/share/tesseract-ocr/*/tessdata/
+#        Windows:               C:\Program Files\Tesseract-OCR\tessdata\
+#   Don't also install/enable stock "hye" alongside it in OCR_LANGS —
+#   two models for the same script fight each other rather than helping.
+#   If you'd rather skip this and use stock Eastern-Armenian-only "hye"
+#   (via `brew install tesseract-lang` / `apt install tesseract-ocr-hye`),
+#   set OCR_LANGS=hye+rus+eng to override the default.
 # See the README for the full per-OS walkthrough.
 pdfminer.six>=20201018
 pytesseract>=0.3.10

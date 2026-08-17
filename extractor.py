@@ -13,6 +13,7 @@ import argparse
 import io
 import os
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -93,8 +94,16 @@ except Exception:
 
 # Tesseract language packs to run together (Armenian docs are often mixed
 # with Russian/English headers and stamps, like the NAIRI medical reports).
+# "hye-calfa-n" (not Tesseract's own "hye") is used for Armenian: it's a
+# community model trained on Classical, Western, *and* Eastern Armenian,
+# vs. stock "hye" which only covers Eastern Armenian orthography — see
+# https://github.com/calfa-co/hye-tesseract. Requires manually placing
+# hye-calfa-n.traineddata in Tesseract's tessdata folder (README/
+# requirements.txt have install steps); if it isn't installed, set
+# OCR_LANGS=hye+rus+eng to fall back to the stock Eastern-Armenian-only
+# model, or OCR_LANGS to whatever languages you do have.
 # Override with the OCR_LANGS env var, e.g. "eng" for Latin-only scans.
-DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
+DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye-calfa-n+rus+eng")
 
 # On Windows, poppler (pdftoppm/pdftocairo) usually isn't on PATH unless
 # manually added; point pdf2image at its bin/ folder via this env var.
@@ -102,12 +111,32 @@ POPPLER_PATH = os.getenv("POPPLER_PATH") or None
 
 
 def _installed_ocr_langs() -> Optional[set]:
+    """List Tesseract's installed language/model codes.
+
+    Deliberately doesn't use pytesseract.get_languages(): it filters
+    tesseract's own `--list-langs` output through a strict `^[a-z_]+$`
+    regex that rejects any code with a hyphen or digit — which silently
+    drops legitimate custom models (e.g. the community "hye-calfa-n"
+    Armenian model) that Tesseract itself lists and runs just fine. That
+    would make _resolve_ocr_langs below wrongly report a real, working
+    language pack as missing.
+    """
     if pytesseract is None:
         return None
     try:
-        return set(pytesseract.get_languages(config=""))
-    except Exception:
+        result = subprocess.run(
+            [pytesseract.pytesseract.tesseract_cmd, "--list-langs"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
         return None
+    # First line is a header ("List of available languages in ..."), the
+    # rest is one language/model code per line.
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    langs = set(lines[1:]) if lines and lines[0].lower().startswith("list of") else set(lines)
+    return langs or None
 
 
 def _resolve_ocr_langs(lang: str) -> str:
