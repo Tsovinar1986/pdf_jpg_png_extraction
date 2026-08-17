@@ -214,6 +214,22 @@ _WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 # comparison outright.
 _REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}")
 
+_HAS_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+
+def _looks_like_text(word: str) -> bool:
+    """A bare stroke, edge, or blob in a graphic/illustration routinely
+    gets misread as a single digit or punctuation mark ("1", "|", ".",
+    ":") — plausible-looking, sometimes even high-confidence, but not
+    text. Requiring at least one real letter (or, for legitimate
+    all-digit content like a page number or a year, at least 2
+    characters) filters those isolated fragments out without rejecting
+    genuine short numbers.
+    """
+    if _HAS_LETTER_RE.search(word):
+        return True
+    return len(word) >= 2
+
 
 def _box_iou(a: tuple, b: tuple) -> float:
     ax, ay, aw, ah = a
@@ -224,6 +240,29 @@ def _box_iou(a: tuple, b: tuple) -> float:
     inter = iw * ih
     union = aw * ah + bw * bh - inter
     return inter / union if union > 0 else 0.0
+
+
+def _boxes_compete(a: tuple, b: tuple) -> bool:
+    """Whether two boxes are plausibly two different candidates' readings
+    of the *same* word position, not two separate words.
+
+    Plain IoU misses a common case: a small fragment box (a different,
+    worse candidate splitting a connected word into pieces) sitting
+    almost entirely *inside* a correct whole-word box. Their union is
+    dominated by the big box, so IoU stays low even though the fragment
+    is clearly not an independent word — it's noise from the same spot.
+    Checking horizontal-overlap-relative-to-the-smaller-box on same-line
+    pairs catches that containment case too.
+    """
+    if _box_iou(a, b) > 0.3:
+        return True
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    if abs(ay - by) >= max(ah, bh) * 0.6:
+        return False  # not even the same line
+    overlap_x = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    smaller_w = min(aw, bw)
+    return smaller_w > 0 and overlap_x / smaller_w > 0.5
 
 
 def _otsu_threshold(gray_img: "Image.Image") -> int:
@@ -404,7 +443,7 @@ def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) 
                 continue
             for i, word in enumerate(data.get("text", [])):
                 word = word.strip()
-                if not word or _REPEATED_CHAR_RE.search(word):
+                if not word or _REPEATED_CHAR_RE.search(word) or not _looks_like_text(word):
                     continue
                 try:
                     conf = float(data["conf"][i])
@@ -431,7 +470,7 @@ def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) 
         # not whether the box is a plausible word at all.
         if w > len(word) * h * 1.3:
             continue
-        if any(_box_iou(box, kb) > 0.3 for kb, _, _ in kept):
+        if any(_boxes_compete(box, kb) for kb, _, _ in kept):
             continue
         kept.append((box, conf, word))
     return kept
