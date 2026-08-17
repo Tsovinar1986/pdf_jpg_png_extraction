@@ -29,7 +29,11 @@ app = FastAPI(title="PDF/Image Text Extraction Service")
 
 FRONTEND_DIR = ROOT_DIR / "frontend"
 
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+# 50MB was too tight for a book-length scanned PDF (hundreds of
+# high-res pages easily exceeds that). 500MB comfortably covers that
+# case while still refusing truly unbounded uploads; override per-
+# deployment with MAX_UPLOAD_MB if you need something else.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "500")) * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
 SUPPORTED_EXTS = ALL_SUPPORTED_EXTS
