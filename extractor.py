@@ -29,9 +29,10 @@ except Exception:
     convert_from_path = None
 
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageFilter, ImageOps
 except Exception:
     Image = None
+    ImageFilter = None
     ImageOps = None
 
 try:
@@ -54,6 +55,13 @@ try:
     import pymupdf
 except Exception:
     pymupdf = None
+
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
 
 try:
     import openpyxl
@@ -156,18 +164,49 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     img = img.convert("RGB")
     if max(img.size) < 2000:
         img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-    return ImageOps.autocontrast(ImageOps.grayscale(img))
+    gray = ImageOps.autocontrast(ImageOps.grayscale(img))
+    # Decorative/script fonts common on posters and graphics are often
+    # anti-aliased into soft edges that blur together at OCR resolution;
+    # a light unsharp mask crisps the strokes back up before thresholding.
+    return gray.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
 
 
 _WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 
-def _ocr_score(text: str) -> int:
-    # Counting raw alnum characters lets noise win: busy illustrations can
-    # OCR into long runs of junk symbols/short fragments that outscore a
-    # short-but-correct reading. Score by letters inside word-like runs of
-    # 3+ characters instead — garbage rarely forms those consistently.
-    return sum(len(w) for w in _WORD_RE.findall(text))
+def _ocr_confidence_score(candidate: "Image.Image", lang: str, config: str) -> "tuple[str, float]":
+    """OCR one candidate image via image_to_data and return (text,
+    confidence-weighted score).
+
+    Scoring by raw word-shaped character count treats any run of 3+
+    letters as equally good, whether Tesseract read it confidently or
+    half-guessed it from artwork noise — on busy poster backgrounds a
+    longer hallucinated word (e.g. "Maueela" from garbled "March") can
+    outscore a shorter but correct one. Weighting by Tesseract's own
+    per-word confidence favors the reading it actually trusts.
+    """
+    try:
+        data = pytesseract.image_to_data(candidate, lang=lang, config=config, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return "", -1.0
+
+    lines: dict = {}
+    score = 0.0
+    for i, word in enumerate(data.get("text", [])):
+        word = word.strip()
+        if not word:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1.0
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+        if conf >= 40:
+            score += sum(len(m) for m in _WORD_RE.findall(word)) * conf
+
+    text = "\n".join(" ".join(words) for words in lines.values())
+    return text, score
 
 
 def _otsu_threshold(gray_img: "Image.Image") -> int:
@@ -195,31 +234,103 @@ def _otsu_threshold(gray_img: "Image.Image") -> int:
     return threshold
 
 
-def _ocr_best_of(img: "Image.Image", lang: str) -> str:
-    """Run OCR against a few different renderings of the same (grayscale)
-    image and keep whichever recognized the most real words.
+def _adaptive_threshold_variants(gray_img: "Image.Image") -> List["Image.Image"]:
+    """Locally-thresholded binarizations of a grayscale image via OpenCV.
+
+    Otsu's threshold is global: it picks one cutoff for the whole image, so
+    it only works when text/background contrast is roughly uniform
+    everywhere. Poster-style graphics with gradients, multi-colored text,
+    and illustration behind the words routinely have different local
+    contrast in different regions — a word that's legible against a
+    lighter corner of the background can vanish into a darker corner
+    under one global cutoff. Gaussian-weighted adaptive thresholding picks
+    a cutoff per neighborhood instead, so it can pick up text a global
+    threshold misses. Returns [] if OpenCV/NumPy aren't installed.
+    """
+    if cv2 is None or np is None:
+        return []
+    arr = np.array(gray_img)
+    variants = []
+    for block_size in (25, 51):
+        binarized = cv2.adaptiveThreshold(
+            arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, 10
+        )
+        variants.append(Image.fromarray(binarized))
+    return variants
+
+
+def _cv2_clahe_variant(img: "Image.Image") -> Optional["Image.Image"]:
+    """A second, independently-tuned preprocessing pipeline via OpenCV:
+    cubic-upscale → auto-invert dark images → CLAHE → bilateral denoise →
+    adaptive threshold.
+
+    The PIL-based pipeline above (autocontrast + unsharp mask) is cheap
+    and works for most images, but CLAHE equalizes local contrast far
+    better than one global autocontrast pass on unevenly-lit poster
+    photos, and a bilateral filter smooths illustration/photo noise while
+    keeping text edges sharp — cases where the simpler pipeline still
+    comes up short. Runs off the original (not the PIL-preprocessed)
+    image so the two pipelines stay independent. Returns None if
+    OpenCV/NumPy aren't installed.
+    """
+    if cv2 is None or np is None:
+        return None
+    gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    if max(gray.shape) < 2000:
+        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    if gray.mean() < 127:
+        gray = cv2.bitwise_not(gray)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    denoised = cv2.bilateralFilter(enhanced, d=9, sigmaColor=75, sigmaSpace=75)
+    thresh = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    return Image.fromarray(thresh)
+
+
+# Engine/page-segmentation combos to try alongside the default. --oem 3
+# (LSTM, Tesseract's default) is pinned explicitly for clarity. --psm 3
+# ("fully automatic") assumes a page laid out in coherent blocks/columns;
+# poster graphics scatter short text fragments around illustrations with
+# no such structure, which can make automatic layout analysis miss them
+# entirely. --psm 6 ("single uniform block") suits a stacked caption like
+# "March / Women's / Day", while --psm 11 ("sparse text") looks for words
+# anywhere in the image in no particular order — between the three, most
+# poster layouts are covered.
+_OCR_CONFIGS = ("--oem 3", "--oem 3 --psm 6", "--oem 3 --psm 11")
+
+
+def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
+    """Run OCR against several different renderings of the same image and
+    keep whichever recognized the most real words.
 
     Tesseract is tuned for solid dark text on a light background. Posters,
     dark-mode screenshots, and images with busy illustrated backgrounds
     can confuse its thresholding badly enough that a plain grayscale pass
-    reads nothing, or hallucinates junk from the artwork. Trying the
-    original, its color inversion, and a binarized (pure black/white,
-    Otsu-thresholded) version of both covers the common failure modes
-    without having to guess which one applies ahead of time.
+    reads nothing, or hallucinates junk from the artwork. Trying two
+    independent preprocessing pipelines (PIL autocontrast/unsharp, and
+    OpenCV CLAHE/bilateral-denoise), each with plain/inverted/Otsu/
+    adaptive-threshold binarization, covers the common failure modes
+    without having to guess which one applies ahead of time; pairing each
+    with a few page segmentation modes covers different poster layouts.
     """
-    threshold = _otsu_threshold(img)
-    binarized = img.point(lambda p: 255 if p > threshold else 0)
-    candidates = [img, ImageOps.invert(img), binarized, ImageOps.invert(binarized)]
+    pil_pre = _preprocess_for_ocr(raw_img)
+    threshold = _otsu_threshold(pil_pre)
+    binarized = pil_pre.point(lambda p: 255 if p > threshold else 0)
+    candidates = [pil_pre, ImageOps.invert(pil_pre), binarized, ImageOps.invert(binarized)]
+    candidates += _adaptive_threshold_variants(pil_pre)
 
-    best_text, best_score = "", -1
+    cv2_variant = _cv2_clahe_variant(raw_img)
+    if cv2_variant is not None:
+        candidates.append(cv2_variant)
+
+    best_text, best_score = "", -1.0
     for candidate in candidates:
-        try:
-            text = pytesseract.image_to_string(candidate, lang=lang)
-        except Exception:
-            continue
-        score = _ocr_score(text)
-        if score > best_score:
-            best_text, best_score = text, score
+        for config in _OCR_CONFIGS:
+            text, score = _ocr_confidence_score(candidate, lang, config)
+            if score > best_score:
+                best_text, best_score = text, score
     return best_text
 
 
@@ -255,7 +366,7 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # with "file in use by another process".
     lang = _resolve_ocr_langs(lang)
     with Image.open(path) as img:
-        return _ocr_best_of(_preprocess_for_ocr(img), lang)
+        return _ocr_best_of(img, lang)
 
 
 def extract_text_from_textfile(path: Path) -> str:
@@ -296,6 +407,59 @@ def extract_text_from_docx(path: Path) -> str:
     return "\n".join(parts)
 
 
+def _strip_text_from_image(img: "Image.Image", lang: str = DEFAULT_OCR_LANGS) -> "Image.Image":
+    """Remove OCR-detected text from an image via inpainting, leaving just
+    the underlying artwork/photo.
+
+    "Extract images" is for pulling out the picture asset itself — a
+    poster's illustration, a product photo — not a duplicate of what
+    "extract text" already returns baked into the picture. Detects text
+    word boxes via Tesseract, then fills them in with OpenCV inpainting
+    using the surrounding pixels. Falls back to returning the image
+    unchanged if OpenCV isn't installed, the language pack is missing, or
+    OCR/inpainting fails for any reason — stripping is a best-effort
+    enhancement, not something that should block image extraction.
+    """
+    if cv2 is None or np is None or pytesseract is None:
+        return img
+
+    try:
+        resolved_lang = _resolve_ocr_langs(lang)
+    except RuntimeError:
+        return img
+
+    rgb = img.convert("RGB")
+    try:
+        data = pytesseract.image_to_data(rgb, lang=resolved_lang, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return img
+
+    mask = np.zeros((rgb.height, rgb.width), dtype=np.uint8)
+    found = False
+    for i, word in enumerate(data.get("text", [])):
+        if not word.strip():
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1.0
+        if conf < 40:
+            continue
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        pad = max(3, int(0.3 * h))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(rgb.width, x + w + pad), min(rgb.height, y + h + pad)
+        mask[y0:y1, x0:x1] = 255
+        found = True
+
+    if not found:
+        return img
+
+    bgr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+    inpainted = cv2.inpaint(bgr, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+    return Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB))
+
+
 def _to_png_bytes(img: "Image.Image") -> bytes:
     if img.mode not in ("RGB", "RGBA", "L"):
         img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
@@ -325,7 +489,7 @@ def extract_images_from_pdf(path: Path) -> List[bytes]:
                     if not raw:
                         continue
                     if Image is not None:
-                        images.append(_to_png_bytes(Image.open(io.BytesIO(raw))))
+                        images.append(_to_png_bytes(_strip_text_from_image(Image.open(io.BytesIO(raw)))))
                     else:
                         images.append(raw)
                 except Exception:
@@ -349,7 +513,7 @@ def extract_images_from_office(path: Path) -> List[bytes]:
             raw = z.read(name)
             if Image is not None:
                 try:
-                    images.append(_to_png_bytes(Image.open(io.BytesIO(raw))))
+                    images.append(_to_png_bytes(_strip_text_from_image(Image.open(io.BytesIO(raw)))))
                     continue
                 except Exception:
                     pass
@@ -365,7 +529,7 @@ def extract_images_from_file(path: Path) -> List[bytes]:
         if Image is None:
             raise RuntimeError("Missing image dependency: install pillow")
         with Image.open(path) as img:
-            return [_to_png_bytes(img)]
+            return [_to_png_bytes(_strip_text_from_image(img))]
     if suffix in OFFICE_ZIP_EXTS:
         return extract_images_from_office(path)
     if suffix in TEXT_EXTS:
