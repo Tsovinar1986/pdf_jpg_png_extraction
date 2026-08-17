@@ -14,6 +14,9 @@ const errorBox = document.getElementById("errorBox");
 const resultBox = document.getElementById("resultBox");
 const resultText = document.getElementById("resultText");
 const resultImagePreview = document.getElementById("resultImagePreview");
+const normalizedPreviewBox = document.getElementById("normalizedPreviewBox");
+const normalizedPreviewImg = document.getElementById("normalizedPreviewImg");
+const normalizedPreviewLink = document.getElementById("normalizedPreviewLink");
 const copyBtn = document.getElementById("copyBtn");
 const downloadBtn = document.getElementById("downloadBtn");
 const downloadForm = document.getElementById("downloadForm");
@@ -39,6 +42,9 @@ function clearPreview() {
   }
   resultImagePreview.classList.add("hidden");
   resultImagePreview.src = "";
+  normalizedPreviewBox.classList.add("hidden");
+  normalizedPreviewImg.src = "";
+  normalizedPreviewLink.href = "#";
 }
 const imagesBox = document.getElementById("imagesBox");
 const imageGallery = document.getElementById("imageGallery");
@@ -181,6 +187,13 @@ submitBtn.addEventListener("click", async () => {
       previewObjectUrl = URL.createObjectURL(selectedFile);
       resultImagePreview.src = previewObjectUrl;
       resultImagePreview.classList.remove("hidden");
+    }
+
+    if (data.normalized_image) {
+      normalizedPreviewImg.src = data.normalized_image;
+      normalizedPreviewLink.href = data.normalized_image;
+      normalizedPreviewLink.download = `${lastResultFilename.replace(/\.[^.]+$/, "")}-cleaned.png`;
+      normalizedPreviewBox.classList.remove("hidden");
     }
 
     resultBox.classList.remove("hidden");

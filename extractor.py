@@ -29,11 +29,12 @@ except Exception:
     convert_from_path = None
 
 try:
-    from PIL import Image, ImageFilter, ImageOps
+    from PIL import Image, ImageFilter, ImageOps, ImageStat
 except Exception:
     Image = None
     ImageFilter = None
     ImageOps = None
+    ImageStat = None
 
 try:
     import pytesseract
@@ -173,40 +174,27 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
 
 _WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
+# A single character repeated 3+ times in a row (e.g. "AAAAAAA") is
+# essentially never real text. It's the classic misread of a repeating
+# decorative graphic — a row of pine-tree triangles, dots, snowflakes, a
+# striped ribbon edge — into the one Latin/Cyrillic/etc. letter that
+# shape resembles. Tesseract is often unnervingly *confident* about that
+# misread since the shape repeats cleanly, so left unfiltered it can
+# rack up a higher confidence-weighted score than the real (shorter,
+# less certain) text elsewhere in a busy image and win the "best of"
+# comparison outright.
+_REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}")
 
-def _ocr_confidence_score(candidate: "Image.Image", lang: str, config: str) -> "tuple[str, float]":
-    """OCR one candidate image via image_to_data and return (text,
-    confidence-weighted score).
 
-    Scoring by raw word-shaped character count treats any run of 3+
-    letters as equally good, whether Tesseract read it confidently or
-    half-guessed it from artwork noise — on busy poster backgrounds a
-    longer hallucinated word (e.g. "Maueela" from garbled "March") can
-    outscore a shorter but correct one. Weighting by Tesseract's own
-    per-word confidence favors the reading it actually trusts.
-    """
-    try:
-        data = pytesseract.image_to_data(candidate, lang=lang, config=config, output_type=pytesseract.Output.DICT)
-    except Exception:
-        return "", -1.0
-
-    lines: dict = {}
-    score = 0.0
-    for i, word in enumerate(data.get("text", [])):
-        word = word.strip()
-        if not word:
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except (ValueError, TypeError):
-            conf = -1.0
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        lines.setdefault(key, []).append(word)
-        if conf >= 40:
-            score += sum(len(m) for m in _WORD_RE.findall(word)) * conf
-
-    text = "\n".join(" ".join(words) for words in lines.values())
-    return text, score
+def _box_iou(a: tuple, b: tuple) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix0, iy0 = max(ax, bx), max(ay, by)
+    ix1, iy1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
 
 
 def _otsu_threshold(gray_img: "Image.Image") -> int:
@@ -289,6 +277,34 @@ def _cv2_clahe_variant(img: "Image.Image") -> Optional["Image.Image"]:
     return Image.fromarray(thresh)
 
 
+def _shading_corrected_variant(img: "Image.Image") -> Optional["Image.Image"]:
+    """Illumination/shading-corrected adaptive-threshold binarization.
+
+    CLAHE and Otsu/adaptive thresholding correct *local* contrast, but a
+    large-scale gradient or vignette across a poster's background (soft
+    lighting, a color fade) can still bias them since it changes the
+    baseline brightness a whole region sits on. Dividing the image by a
+    heavily morphologically-opened (i.e. large-scale-blurred) version of
+    itself cancels that gradient out first, so the adaptive threshold
+    that follows only has to deal with the actual text strokes on an
+    already-flattened background. Returns None if OpenCV/NumPy aren't
+    installed.
+    """
+    if cv2 is None or np is None:
+        return None
+    gray = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    if max(gray.shape) < 2000:
+        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    background = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+    background = np.where(background == 0, 1, background).astype(np.uint8)
+    normalized = cv2.divide(gray, background, scale=255)
+    thresh = cv2.adaptiveThreshold(
+        normalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+    )
+    return Image.fromarray(thresh)
+
+
 # Engine/page-segmentation combos to try alongside the default. --oem 3
 # (LSTM, Tesseract's default) is pinned explicitly for clarity. --psm 3
 # ("fully automatic") assumes a page laid out in coherent blocks/columns;
@@ -301,37 +317,212 @@ def _cv2_clahe_variant(img: "Image.Image") -> Optional["Image.Image"]:
 _OCR_CONFIGS = ("--oem 3", "--oem 3 --psm 6", "--oem 3 --psm 11")
 
 
-def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
-    """Run OCR against several different renderings of the same image and
-    keep whichever recognized the most real words.
+def _ocr_candidate_images(raw_img: "Image.Image") -> List[tuple]:
+    """Build several different renderings of the same image for OCR to try,
+    each paired with its (scale_x, scale_y) relative to raw_img.
 
     Tesseract is tuned for solid dark text on a light background. Posters,
     dark-mode screenshots, and images with busy illustrated backgrounds
     can confuse its thresholding badly enough that a plain grayscale pass
-    reads nothing, or hallucinates junk from the artwork. Trying two
-    independent preprocessing pipelines (PIL autocontrast/unsharp, and
-    OpenCV CLAHE/bilateral-denoise), each with plain/inverted/Otsu/
-    adaptive-threshold binarization, covers the common failure modes
-    without having to guess which one applies ahead of time; pairing each
-    with a few page segmentation modes covers different poster layouts.
+    reads nothing, or hallucinates junk from the artwork. Two independent
+    preprocessing pipelines (PIL autocontrast/unsharp, and OpenCV
+    CLAHE/bilateral-denoise), each with plain/inverted/Otsu/adaptive-
+    threshold binarization, cover the common failure modes without having
+    to guess which one applies ahead of time.
     """
     pil_pre = _preprocess_for_ocr(raw_img)
+    sx, sy = pil_pre.width / raw_img.width, pil_pre.height / raw_img.height
     threshold = _otsu_threshold(pil_pre)
     binarized = pil_pre.point(lambda p: 255 if p > threshold else 0)
-    candidates = [pil_pre, ImageOps.invert(pil_pre), binarized, ImageOps.invert(binarized)]
-    candidates += _adaptive_threshold_variants(pil_pre)
+    candidates = [
+        (pil_pre, sx, sy),
+        (ImageOps.invert(pil_pre), sx, sy),
+        (binarized, sx, sy),
+        (ImageOps.invert(binarized), sx, sy),
+    ]
+    candidates += [(v, sx, sy) for v in _adaptive_threshold_variants(pil_pre)]
 
     cv2_variant = _cv2_clahe_variant(raw_img)
     if cv2_variant is not None:
-        candidates.append(cv2_variant)
+        candidates.append((cv2_variant, cv2_variant.width / raw_img.width, cv2_variant.height / raw_img.height))
 
-    best_text, best_score = "", -1.0
-    for candidate in candidates:
+    shading_variant = _shading_corrected_variant(raw_img)
+    if shading_variant is not None:
+        candidates.append((shading_variant, shading_variant.width / raw_img.width, shading_variant.height / raw_img.height))
+
+    return candidates
+
+
+def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) -> List[tuple]:
+    """Run every candidate rendering × page-segmentation config and return
+    every accepted (box, conf, word) detection, in raw_img's own pixel
+    coordinates, with duplicates from overlapping candidates collapsed.
+
+    A single "best overall candidate" doesn't exist for busy multi-color
+    graphics: one thresholding pass may read a ribbon banner's yellow-on-
+    red text well but miss a heading entirely, while another does the
+    reverse. Collecting detections from every candidate and keeping the
+    highest-confidence read of each *region* (rather than picking one
+    candidate's full-image output) lets each region be read by whichever
+    rendering actually suits it.
+    """
+    detections = []
+    for candidate, sx, sy in _ocr_candidate_images(raw_img):
         for config in _OCR_CONFIGS:
-            text, score = _ocr_confidence_score(candidate, lang, config)
-            if score > best_score:
-                best_text, best_score = text, score
-    return best_text
+            try:
+                data = pytesseract.image_to_data(candidate, lang=lang, config=config, output_type=pytesseract.Output.DICT)
+            except Exception:
+                continue
+            for i, word in enumerate(data.get("text", [])):
+                word = word.strip()
+                if not word or _REPEATED_CHAR_RE.search(word):
+                    continue
+                try:
+                    conf = float(data["conf"][i])
+                except (ValueError, TypeError):
+                    conf = -1.0
+                if conf < min_conf:
+                    continue
+                box = (
+                    data["left"][i] / sx,
+                    data["top"][i] / sy,
+                    data["width"][i] / sx,
+                    data["height"][i] / sy,
+                )
+                detections.append((box, conf, word))
+
+    detections.sort(key=lambda d: -d[1])
+    kept = []
+    for box, conf, word in detections:
+        x, y, w, h = box
+        # A misread graphic (a ribbon edge, an arrow tip, a row of icons)
+        # can get labeled as one "word" spanning a box far wider per
+        # character than real text ever is — Tesseract's confidence
+        # reflects how sure it is about the character shapes it guessed,
+        # not whether the box is a plausible word at all.
+        if w > len(word) * h * 1.3:
+            continue
+        if any(_box_iou(box, kb) > 0.3 for kb, _, _ in kept):
+            continue
+        kept.append((box, conf, word))
+    return kept
+
+
+def _cluster_lines(detections: List[tuple]) -> List[dict]:
+    """Group detections into horizontal lines by vertical overlap AND
+    horizontal proximity to the nearest word already in that line,
+    top-to-bottom.
+
+    Vertical proximity alone isn't enough: a decorative glyph in a
+    border far to the side of the page can share a similar y-coordinate
+    with a real text line purely by coincidence and get merged into it,
+    which then throws off anything built on top of these lines (reading
+    order, paragraph-block detection). Requiring the new word to actually
+    sit close to its nearest neighbor in the line — not just anywhere in
+    a wide y-band — keeps unrelated same-row content separate.
+    """
+    by_top = sorted(detections, key=lambda d: d[0][1])
+    lines: List[dict] = []
+    for det in by_top:
+        x, y, w, h = det[0]
+        line = None
+        for ln in lines:
+            if abs(y - ln["y"]) >= h * 0.6:
+                continue
+            nearest_gap = min(max(x - (ox + ow), ox - (x + w)) for (ox, _oy, ow, _oh), _c, _wd in ln["dets"])
+            if nearest_gap < h * 8:
+                line = ln
+                break
+        if line is None:
+            lines.append({"y": y, "dets": [det]})
+        else:
+            line["dets"].append(det)
+            line["y"] = (line["y"] + y) / 2
+    lines.sort(key=lambda ln: ln["y"])
+    return lines
+
+
+def _detections_to_text(detections: List[tuple]) -> str:
+    """Assemble kept detections into reading-order text: cluster into
+    lines by vertical overlap, then sort each line left-to-right."""
+    lines = _cluster_lines(detections)
+    return "\n".join(
+        " ".join(word for (x, _y, _w, _h), _conf, word in sorted(ln["dets"], key=lambda d: d[0][0]))
+        for ln in lines
+    )
+
+
+def _prefer_dominant_paragraph_block(detections: List[tuple]) -> List[tuple]:
+    """If the detections contain one clearly dominant multi-line
+    paragraph block, apply a stricter confidence bar to everything
+    outside it.
+
+    Ornate decorative borders/frames (lace patterns, a ring of small
+    icons around a greeting card) can generate dozens of scattered,
+    medium-confidence word-shaped misreads that individually clear the
+    normal bar. A real paragraph is reliably several consecutive,
+    closely-spaced lines with multiple words each — border noise almost
+    never clusters that way. When such a block clearly exists, trust it
+    and demand more confidence from everything else. Posters/captions
+    made of a few separate short text elements (no dominant block) are
+    left untouched, since this would otherwise wrongly gut them.
+    """
+    lines = _cluster_lines(detections)
+    if len(lines) < 3:
+        return detections
+
+    heights = sorted(d[0][3] for ln in lines for d in ln["dets"])
+    median_h = heights[len(heights) // 2]
+    if median_h <= 0:
+        return detections
+
+    # Group lines into blocks by *both* vertical proximity and horizontal
+    # overlap. Y-proximity alone isn't enough: a column of single-glyph
+    # border noise running down one edge sits at roughly the same
+    # y-positions as a paragraph's lines and would otherwise chain
+    # together into a tall fake "block" purely from tight vertical
+    # spacing, even though each of its "lines" has only one word. Also
+    # requiring horizontal overlap keeps a side column of noise from ever
+    # joining the paragraph's block, since they occupy disjoint x-ranges.
+    blocks: List[dict] = []
+    for ln in lines:
+        x0 = min(d[0][0] for d in ln["dets"])
+        x1 = max(d[0][0] + d[0][2] for d in ln["dets"])
+        placed = False
+        for blk in blocks:
+            last = blk["lines"][-1]
+            overlaps = x0 <= blk["x1"] and blk["x0"] <= x1
+            if overlaps and (ln["y"] - last["y"]) < median_h * 1.8:
+                blk["lines"].append(ln)
+                blk["x0"], blk["x1"] = min(blk["x0"], x0), max(blk["x1"], x1)
+                placed = True
+                break
+        if not placed:
+            blocks.append({"lines": [ln], "x0": x0, "x1": x1})
+
+    def word_count(blk):
+        return sum(len(ln["dets"]) for ln in blk["lines"])
+
+    # A real paragraph has multiple words on nearly every line; scattered
+    # border noise averages close to one word per "line" even when it
+    # does chain together. Requiring a minimum density here is what
+    # actually excludes it, not line count alone.
+    paragraph_like = [b for b in blocks if len(b["lines"]) >= 3 and word_count(b) / len(b["lines"]) >= 3]
+    if not paragraph_like:
+        return detections  # nothing clearly paragraph-shaped; leave as-is
+
+    dominant = max(paragraph_like, key=lambda b: (len(b["lines"]), word_count(b)))
+    if word_count(dominant) < 9:
+        return detections
+
+    dominant_ids = {id(d) for ln in dominant["lines"] for d in ln["dets"]}
+    return [det for det in detections if id(det) in dominant_ids or det[1] >= 65]
+
+
+def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
+    detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
+    detections = _prefer_dominant_paragraph_block(detections)
+    return _detections_to_text(detections)
 
 
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
@@ -367,6 +558,39 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     lang = _resolve_ocr_langs(lang)
     with Image.open(path) as img:
         return _ocr_best_of(img, lang)
+
+
+def normalize_dark_image_to_paper(img: "Image.Image") -> Optional["Image.Image"]:
+    """If the image looks like light text on a dark background, convert it
+    to a normal-looking scanned-paper style: white background, black text.
+
+    Dark-mode screenshots and dark poster/flyer designs are readable to a
+    person but visually the inverse of a normal document; producing a
+    black-on-white version alongside the extracted text gives something
+    that looks like what people expect a "cleaned up" text image to look
+    like. Returns None if the image isn't dark-background to begin with
+    (nothing to normalize) or if Pillow isn't installed.
+    """
+    if Image is None or ImageOps is None or ImageStat is None:
+        return None
+
+    gray = ImageOps.grayscale(img.convert("RGB"))
+    if ImageStat.Stat(gray).mean[0] >= 127:
+        return None  # already a light background
+
+    threshold = _otsu_threshold(gray)
+    binarized = gray.point(lambda p: 255 if p > threshold else 0)
+
+    # Otsu doesn't know which side of the cutoff is "background" vs
+    # "text" — assume whichever value covers more pixels is the
+    # background, and normalize so background is always white (255) and
+    # text is always black (0), regardless of the source's original
+    # polarity or color.
+    hist = binarized.histogram()
+    if hist[0] > hist[255]:
+        binarized = ImageOps.invert(binarized)
+
+    return binarized.convert("RGB")
 
 
 def extract_text_from_textfile(path: Path) -> str:
@@ -413,12 +637,17 @@ def _strip_text_from_image(img: "Image.Image", lang: str = DEFAULT_OCR_LANGS) ->
 
     "Extract images" is for pulling out the picture asset itself — a
     poster's illustration, a product photo — not a duplicate of what
-    "extract text" already returns baked into the picture. Detects text
-    word boxes via Tesseract, then fills them in with OpenCV inpainting
-    using the surrounding pixels. Falls back to returning the image
-    unchanged if OpenCV isn't installed, the language pack is missing, or
-    OCR/inpainting fails for any reason — stripping is a best-effort
-    enhancement, not something that should block image extraction.
+    "extract text" already returns baked into the picture. Reuses the
+    same multi-candidate detection battery as text extraction (plain
+    single-pass detection reliably misses decorative/stylized fonts on
+    busy backgrounds, leaving the original text untouched) but with a
+    much lower confidence floor: finding *where* text roughly is only
+    needs to be right enough to mask it, not right enough to read it, so
+    it's fine to be far more liberal here than when extracting text.
+    Falls back to returning the image unchanged if OpenCV isn't
+    installed, the language pack is missing, or OCR/inpainting fails for
+    any reason — stripping is a best-effort enhancement, not something
+    that should block image extraction.
     """
     if cv2 is None or np is None or pytesseract is None:
         return img
@@ -430,30 +659,24 @@ def _strip_text_from_image(img: "Image.Image", lang: str = DEFAULT_OCR_LANGS) ->
 
     rgb = img.convert("RGB")
     try:
-        data = pytesseract.image_to_data(rgb, lang=resolved_lang, output_type=pytesseract.Output.DICT)
+        # A near-zero floor (below ~15) starts admitting misreads of
+        # repeating decorative patterns (a row of pine-tree/dot/snowflake
+        # shapes) as one long, low-confidence "word" spanning the whole
+        # row — genuine text, even faint or stylized, reliably scores
+        # well above that.
+        detections = _collect_ocr_detections(rgb, resolved_lang, min_conf=15)
     except Exception:
         return img
 
-    mask = np.zeros((rgb.height, rgb.width), dtype=np.uint8)
-    found = False
-    for i, word in enumerate(data.get("text", [])):
-        if not word.strip():
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except (ValueError, TypeError):
-            conf = -1.0
-        if conf < 40:
-            continue
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        pad = max(3, int(0.3 * h))
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(rgb.width, x + w + pad), min(rgb.height, y + h + pad)
-        mask[y0:y1, x0:x1] = 255
-        found = True
-
-    if not found:
+    if not detections:
         return img
+
+    mask = np.zeros((rgb.height, rgb.width), dtype=np.uint8)
+    for (x, y, w, h), _conf, _word in detections:
+        pad = max(3, int(0.3 * h))
+        x0, y0 = max(0, int(x - pad)), max(0, int(y - pad))
+        x1, y1 = min(rgb.width, int(x + w + pad)), min(rgb.height, int(y + h + pad))
+        mask[y0:y1, x0:x1] = 255
 
     bgr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
     inpainted = cv2.inpaint(bgr, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)

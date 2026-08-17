@@ -1,11 +1,12 @@
 import base64
 import contextlib
+import io
 import os
 import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterator, List
+from typing import Iterator, List, Optional
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
@@ -13,9 +14,16 @@ sys.path.insert(0, str(ROOT_DIR))
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
 
-from extractor import ALL_SUPPORTED_EXTS, extract_images_from_file, extract_text_from_path
+from extractor import (
+    ALL_SUPPORTED_EXTS,
+    IMAGE_EXTS,
+    extract_images_from_file,
+    extract_text_from_path,
+    normalize_dark_image_to_paper,
+)
 
 app = FastAPI(title="PDF/Image Text Extraction Service")
 
@@ -30,6 +38,7 @@ SUPPORTED_EXTS = ALL_SUPPORTED_EXTS
 class ExtractionResponse(BaseModel):
     text: str
     filename: str
+    normalized_image: Optional[str] = None
 
 
 class ExtractedImage(BaseModel):
@@ -80,7 +89,19 @@ async def extract_text(file: UploadFile = File(...)):
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return ExtractionResponse(text=text or "", filename=file.filename or "")
+        normalized_data_url = None
+        if tmp_path.suffix.lower() in IMAGE_EXTS:
+            try:
+                with Image.open(tmp_path) as img:
+                    normalized = normalize_dark_image_to_paper(img)
+                if normalized is not None:
+                    buf = io.BytesIO()
+                    normalized.save(buf, format="PNG")
+                    normalized_data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception:
+                pass  # the normalized preview is a bonus, not required for a successful extraction
+
+    return ExtractionResponse(text=text or "", filename=file.filename or "", normalized_image=normalized_data_url)
 
 
 @app.post("/api/extract-images", response_model=ImageExtractionResponse)

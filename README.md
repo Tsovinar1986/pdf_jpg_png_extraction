@@ -32,6 +32,7 @@ sudo apt-get install tesseract-ocr tesseract-ocr-hye tesseract-ocr-rus poppler-u
 **Windows**
 
 - Install Tesseract from the [UB Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki). **During setup, expand "Additional language data" and check Armenian and Russian** (`hye`, `rus`) — they're not installed by default, only English is. This step is easy to miss; if you already installed without it, rerun the installer and check "Modify" to add them.
+  - Alternatively, download `hye.traineddata` / `rus.traineddata` directly from the [tessdata repo](https://github.com/tesseract-ocr/tessdata) and drop them into Tesseract-OCR's `tessdata` folder (e.g. `C:\Program Files\Tesseract-OCR\tessdata`) — useful if you can't rerun the installer.
 - Install Poppler for Windows from [oschwartz10612/poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases).
 - Either add both tools' folders to your `PATH`, or point the app at them directly with environment variables (no PATH changes needed):
 
