@@ -103,6 +103,23 @@ Then open http://127.0.0.1:8000 in your browser. Upload a PDF or image and:
 - **Extract text** — runs OCR/text extraction and shows the result (with an image preview when the upload is an image).
 - **Extract images** — pulls out embedded images from a PDF (or the image itself), downloadable individually from the gallery.
 
+### Run with Docker
+
+Skips the entire per-OS Tesseract/Poppler/language-pack setup above — everything the app needs (including the Armenian and Russian language data) is baked into the image, so it behaves identically on macOS, Linux, and Windows:
+
+```sh
+docker compose up --build
+```
+
+Or plain Docker, without Compose:
+
+```sh
+docker build -t text-extractor .
+docker run -p 8000:8000 text-extractor
+```
+
+Then open http://127.0.0.1:8000. `OCR_LANGS` and `MAX_UPLOAD_MB` can be overridden via a `.env` file in the project root (picked up automatically by `docker compose`) or `docker run -e`.
+
 ### API
 
 | Endpoint | Method | Description |

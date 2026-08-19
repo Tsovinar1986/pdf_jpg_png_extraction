@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
+LICENSE
+
+# Stray npm leftovers — this frontend has no build step or dependencies.
+frontend/package.json
+frontend/package-lock.json
