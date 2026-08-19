@@ -416,6 +416,69 @@ def _ocr_candidate_images(raw_img: "Image.Image") -> List[tuple]:
     return candidates
 
 
+def _detections_from_candidate(candidate: "Image.Image", sx: float, sy: float, lang: str, config: str, min_conf: float) -> List[tuple]:
+    """Run OCR on one candidate rendering/config and return accepted
+    (box, conf, word) detections in the original image's pixel coordinates."""
+    try:
+        data = pytesseract.image_to_data(candidate, lang=lang, config=config, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return []
+    out = []
+    for i, word in enumerate(data.get("text", [])):
+        word = word.strip()
+        if not word or _REPEATED_CHAR_RE.search(word) or not _looks_like_text(word):
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1.0
+        if conf < min_conf:
+            continue
+        box = (
+            data["left"][i] / sx,
+            data["top"][i] / sy,
+            data["width"][i] / sx,
+            data["height"][i] / sy,
+        )
+        out.append((box, conf, word))
+    return out
+
+
+def _dedup_detections(detections: List[tuple]) -> List[tuple]:
+    """Collapse duplicate/overlapping detections down to one (box, conf,
+    word, support) per region, keeping the highest-confidence read and
+    recording how many of the raw (pre-dedup) detections — i.e. how many
+    different candidate renderings/configs — proposed something at
+    roughly that same spot.
+
+    That support count is what later tells genuine text apart from noise
+    on busy illustrated images: real text tends to get found by several
+    independently-thresholded renderings at roughly the same place, while
+    a random patch of illustration texture only forms a plausible-looking
+    "word" shape under one particular thresholding by chance, and rarely
+    does so consistently across renderings — even though, taken alone,
+    Tesseract can be just as confident about that one misread as it is
+    about a real word.
+    """
+    all_boxes = [d[0] for d in detections]
+    sorted_dets = sorted(detections, key=lambda d: -d[1])
+    kept = []
+    for box, conf, word in sorted_dets:
+        x, y, w, h = box
+        # A misread graphic (a ribbon edge, an arrow tip, a row of icons)
+        # can get labeled as one "word" spanning a box far wider per
+        # character than real text ever is — Tesseract's confidence
+        # reflects how sure it is about the character shapes it guessed,
+        # not whether the box is a plausible word at all.
+        if w > len(word) * h * 1.3:
+            continue
+        if any(_boxes_compete(box, kb) for kb, _c, _w, _s in kept):
+            continue
+        support = sum(1 for b2 in all_boxes if _boxes_compete(box, b2))
+        kept.append((box, conf, word, support))
+    return kept
+
+
 def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) -> List[tuple]:
     """Run every candidate rendering × page-segmentation config and return
     every accepted (box, conf, word) detection, in raw_img's own pixel
@@ -432,75 +495,65 @@ def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) 
     detections = []
     for candidate, sx, sy in _ocr_candidate_images(raw_img):
         for config in _OCR_CONFIGS:
-            try:
-                data = pytesseract.image_to_data(candidate, lang=lang, config=config, output_type=pytesseract.Output.DICT)
-            except Exception:
-                continue
-            for i, word in enumerate(data.get("text", [])):
-                word = word.strip()
-                if not word or _REPEATED_CHAR_RE.search(word) or not _looks_like_text(word):
-                    continue
-                try:
-                    conf = float(data["conf"][i])
-                except (ValueError, TypeError):
-                    conf = -1.0
-                if conf < min_conf:
-                    continue
-                box = (
-                    data["left"][i] / sx,
-                    data["top"][i] / sy,
-                    data["width"][i] / sx,
-                    data["height"][i] / sy,
-                )
-                detections.append((box, conf, word))
-
-    detections.sort(key=lambda d: -d[1])
-    kept = []
-    for box, conf, word in detections:
-        x, y, w, h = box
-        # A misread graphic (a ribbon edge, an arrow tip, a row of icons)
-        # can get labeled as one "word" spanning a box far wider per
-        # character than real text ever is — Tesseract's confidence
-        # reflects how sure it is about the character shapes it guessed,
-        # not whether the box is a plausible word at all.
-        if w > len(word) * h * 1.3:
-            continue
-        if any(_boxes_compete(box, kb) for kb, _, _ in kept):
-            continue
-        kept.append((box, conf, word))
-    return kept
+            detections.extend(_detections_from_candidate(candidate, sx, sy, lang, config, min_conf))
+    return _dedup_detections(detections)
 
 
 def _cluster_lines(detections: List[tuple]) -> List[dict]:
     """Group detections into horizontal lines by vertical overlap AND
-    horizontal proximity to the nearest word already in that line,
-    top-to-bottom.
+    horizontal proximity to *some* other word already known to share the
+    line — connected transitively (union-find over all pairs), not just
+    "close to the nearest word processed so far".
 
-    Vertical proximity alone isn't enough: a decorative glyph in a
-    border far to the side of the page can share a similar y-coordinate
-    with a real text line purely by coincidence and get merged into it,
-    which then throws off anything built on top of these lines (reading
-    order, paragraph-block detection). Requiring the new word to actually
-    sit close to its nearest neighbor in the line — not just anywhere in
-    a wide y-band — keeps unrelated same-row content separate.
+    Vertical proximity alone isn't enough: a decorative glyph in a border
+    far to the side of the page can share a similar y-coordinate with a
+    real text line purely by coincidence and get merged into it.
+    Requiring horizontal proximity keeps unrelated same-row content
+    separate — but that check has to be transitive. A single greedy pass
+    over detections sorted by y, matching each one against only the
+    nearest word already accumulated in a line so far, is order-
+    dependent: tiny per-word y jitter (ascenders, cap-height nudging one
+    box a few pixels higher than its neighbors) can process a long
+    line's words out of left-to-right order, splitting one real text
+    line into two or three fragments before enough words have joined a
+    chain to bridge them back together. Union-find over every pair
+    doesn't have that ordering problem — a line forms correctly
+    regardless of which order its words happen to be visited in.
     """
-    by_top = sorted(detections, key=lambda d: d[0][1])
-    lines: List[dict] = []
-    for det in by_top:
-        x, y, w, h = det[0]
-        line = None
-        for ln in lines:
-            if abs(y - ln["y"]) >= h * 0.6:
+    n = len(detections)
+    boxes = [d[0] for d in detections]
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        xi, yi, wi, hi = boxes[i]
+        for j in range(i + 1, n):
+            xj, yj, wj, hj = boxes[j]
+            if abs(yi - yj) >= max(hi, hj) * 0.6:
                 continue
-            nearest_gap = min(max(x - (ox + ow), ox - (x + w)) for (ox, _oy, ow, _oh), _c, _wd in ln["dets"])
-            if nearest_gap < h * 8:
-                line = ln
-                break
-        if line is None:
-            lines.append({"y": y, "dets": [det]})
-        else:
-            line["dets"].append(det)
-            line["y"] = (line["y"] + y) / 2
+            gap = max(xi - (xj + wj), xj - (xi + wi))
+            if gap < max(hi, hj) * 8:
+                union(i, j)
+
+    groups: dict = {}
+    for i, det in enumerate(detections):
+        groups.setdefault(find(i), []).append(det)
+
+    lines = []
+    for dets in groups.values():
+        y0 = min(d[0][1] for d in dets)
+        y1 = max(d[0][1] + d[0][3] for d in dets)
+        lines.append({"y": (y0 + y1) / 2, "dets": dets})
     lines.sort(key=lambda ln: ln["y"])
     return lines
 
@@ -510,34 +563,47 @@ def _detections_to_text(detections: List[tuple]) -> str:
     lines by vertical overlap, then sort each line left-to-right."""
     lines = _cluster_lines(detections)
     return "\n".join(
-        " ".join(word for (x, _y, _w, _h), _conf, word in sorted(ln["dets"], key=lambda d: d[0][0]))
+        " ".join(det[2] for det in sorted(ln["dets"], key=lambda d: d[0][0]))
         for ln in lines
     )
 
 
-def _prefer_dominant_paragraph_block(detections: List[tuple]) -> List[tuple]:
-    """If the detections contain one clearly dominant multi-line
-    paragraph block, apply a stricter confidence bar to everything
-    outside it.
+# Trust bar for a detection to stand on its own — outside a dominant
+# paragraph block, or as part of what makes a candidate block "real" in
+# the first place: both a high confidence AND a high cross-rendering
+# support are required. Confidence alone doesn't discriminate — a random
+# patch of illustration texture can score just as "confident" as real
+# text under one particular thresholding — but real text is reliably
+# found by many independently-thresholded renderings at the same spot,
+# while that kind of noise rarely is. Calibrated against a busy
+# illustrated poster (many high-confidence noise detections, support up
+# to 13) and a set of clean chat-bubble captions (real short words with
+# support as low as 4): this is the tightest bar that still eliminates
+# 100% of the poster noise while keeping the large majority of genuine
+# short captions/words.
+_MIN_TRUSTED_SUPPORT = 8
+_MIN_TRUSTED_CONFIDENCE = 85.0
+
+
+def _find_dominant_paragraph_block(detections: List[tuple]) -> Optional[dict]:
+    """Find one clearly dominant multi-line paragraph block among the
+    detections, if there is one, or None.
 
     Ornate decorative borders/frames (lace patterns, a ring of small
     icons around a greeting card) can generate dozens of scattered,
     medium-confidence word-shaped misreads that individually clear the
     normal bar. A real paragraph is reliably several consecutive,
     closely-spaced lines with multiple words each — border noise almost
-    never clusters that way. When such a block clearly exists, trust it
-    and demand more confidence from everything else. Posters/captions
-    made of a few separate short text elements (no dominant block) are
-    left untouched, since this would otherwise wrongly gut them.
+    never clusters that way.
     """
     lines = _cluster_lines(detections)
     if len(lines) < 3:
-        return detections
+        return None
 
     heights = sorted(d[0][3] for ln in lines for d in ln["dets"])
     median_h = heights[len(heights) // 2]
     if median_h <= 0:
-        return detections
+        return None
 
     # Group lines into blocks by *both* vertical proximity and horizontal
     # overlap. Y-proximity alone isn't enough: a column of single-glyph
@@ -566,23 +632,120 @@ def _prefer_dominant_paragraph_block(detections: List[tuple]) -> List[tuple]:
     def word_count(blk):
         return sum(len(ln["dets"]) for ln in blk["lines"])
 
+    def is_high_quality(blk) -> bool:
+        # Density (lines × words/line) alone isn't a safe signal on a
+        # heavily-noisy image: a busy illustration can produce so many
+        # scattered low-quality detections that a "block" of pure noise
+        # still clears the density bar by sheer volume. Requiring most of
+        # a candidate block's own words to individually clear the same
+        # trust bar used elsewhere (high confidence AND cross-rendering
+        # support) is what actually tells a real paragraph — where nearly
+        # every word is a solid, repeatedly-confirmed read — apart from
+        # that kind of noise, where only a stray word or two would.
+        dets = [d for ln in blk["lines"] for d in ln["dets"]]
+        if not dets:
+            return False
+        trusted = sum(1 for d in dets if d[3] >= _MIN_TRUSTED_SUPPORT and d[1] >= _MIN_TRUSTED_CONFIDENCE)
+        return trusted / len(dets) >= 0.6
+
     # A real paragraph has multiple words on nearly every line; scattered
     # border noise averages close to one word per "line" even when it
     # does chain together. Requiring a minimum density here is what
     # actually excludes it, not line count alone.
-    paragraph_like = [b for b in blocks if len(b["lines"]) >= 3 and word_count(b) / len(b["lines"]) >= 3]
+    paragraph_like = [
+        b for b in blocks
+        if len(b["lines"]) >= 3 and word_count(b) / len(b["lines"]) >= 3 and is_high_quality(b)
+    ]
     if not paragraph_like:
-        return detections  # nothing clearly paragraph-shaped; leave as-is
+        return None  # nothing clearly paragraph-shaped
 
     dominant = max(paragraph_like, key=lambda b: (len(b["lines"]), word_count(b)))
     if word_count(dominant) < 9:
-        return detections
+        return None
+    return dominant
 
-    dominant_ids = {id(d) for ln in dominant["lines"] for d in ln["dets"]}
-    return [det for det in detections if id(det) in dominant_ids or det[1] >= 65]
+
+def _prefer_dominant_paragraph_block(detections: List[tuple]) -> List[tuple]:
+    """If the detections contain one clearly dominant paragraph block,
+    trust it outright and apply the stricter confidence+support bar to
+    everything outside it. With no dominant block (posters/captions made
+    of a few separate short text elements, or a busy illustration with no
+    real text structure at all), apply that same bar to everything.
+    """
+    dominant = _find_dominant_paragraph_block(detections)
+    dominant_ids = {id(d) for ln in dominant["lines"] for d in ln["dets"]} if dominant else set()
+    return [
+        det for det in detections
+        if id(det) in dominant_ids or (det[3] >= _MIN_TRUSTED_SUPPORT and det[1] >= _MIN_TRUSTED_CONFIDENCE)
+    ]
+
+
+def _full_text_score(text: str) -> int:
+    return sum(len(w) for w in _WORD_RE.findall(text))
+
+
+# Full-page configs for the "trust Tesseract's own reading order" path —
+# --psm 11 (sparse text, no particular order) is deliberately excluded
+# here since it's the opposite of what a coherent document needs.
+_DOCUMENT_OCR_CONFIGS = ("--oem 3", "--oem 3 --psm 4", "--oem 3 --psm 6")
+
+
+def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
+    """Full-page OCR that trusts Tesseract's own built-in reading-order
+    reconstruction, trying each candidate rendering/config and keeping
+    whichever recognized the most real words.
+    """
+    best_text, best_score = "", -1
+    for candidate, _sx, _sy in _ocr_candidate_images(raw_img):
+        for config in _DOCUMENT_OCR_CONFIGS:
+            try:
+                text = pytesseract.image_to_string(candidate, lang=lang, config=config)
+            except Exception:
+                continue
+            score = _full_text_score(text)
+            if score > best_score:
+                best_text, best_score = text, score
+    return best_text
+
+
+def _looks_like_dense_document(lines: List[dict]) -> bool:
+    """Whether a probe pass's lines look like a normal multi-line text
+    document (many lines with several words each) rather than scattered
+    poster/graphic-style fragments.
+
+    Deliberately not based on _find_dominant_paragraph_block's cross-line
+    grouping: that function's "does line N join line N+1's block" gap
+    threshold (median word-height × 1.8) was tuned against poster-style
+    content, where word height and line spacing are both dictated by one
+    big display font. Normal single-spaced body text has a much smaller
+    word-bounding-box height relative to its line pitch (leading adds
+    space a word's own ink never occupies), so that same threshold can
+    fail to bridge even consecutive lines *within* one paragraph — this
+    needs its own, simpler signal: just line/word density, no grouping.
+    """
+    dense_lines = [ln for ln in lines if len(ln["dets"]) >= 4]
+    total_words = sum(len(ln["dets"]) for ln in lines)
+    return len(dense_lines) >= 5 and total_words >= 20
 
 
 def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
+    # Cheap single-pass probe (one rendering, one config) to tell a normal
+    # dense document apart from scattered poster/graphic-style text,
+    # before paying for either strategy's full multi-candidate cost.
+    primary = _preprocess_for_ocr(raw_img)
+    sx, sy = primary.width / raw_img.width, primary.height / raw_img.height
+    probe = _dedup_detections(_detections_from_candidate(primary, sx, sy, lang, "--oem 3", min_conf=40))
+    if _looks_like_dense_document(_cluster_lines(probe)):
+        # Trust Tesseract's own full-page reading-order reconstruction
+        # instead of our merged-detection one: different renderings/
+        # configs yield slightly different word boxes for the same text,
+        # and stitching several of them back into lines can scramble
+        # reading order or drop a word that lost a confidence tie-break —
+        # a real, observed failure mode on long wrapped paragraphs, and
+        # not a risk worth taking once the page is clearly normal
+        # multi-line text.
+        return _best_full_page_text(raw_img, lang)
+
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
     detections = _prefer_dominant_paragraph_block(detections)
     return _detections_to_text(detections)
@@ -735,7 +898,8 @@ def _strip_text_from_image(img: "Image.Image", lang: str = DEFAULT_OCR_LANGS) ->
         return img
 
     mask = np.zeros((rgb.height, rgb.width), dtype=np.uint8)
-    for (x, y, w, h), _conf, _word in detections:
+    for det in detections:
+        x, y, w, h = det[0]
         pad = max(3, int(0.3 * h))
         x0, y0 = max(0, int(x - pad)), max(0, int(y - pad))
         x1, y1 = min(rgb.width, int(x + w + pad)), min(rgb.height, int(y + h + pad))
