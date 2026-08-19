@@ -368,16 +368,21 @@ def _shading_corrected_variant(img: "Image.Image") -> Optional["Image.Image"]:
     return Image.fromarray(thresh)
 
 
-# Engine/page-segmentation combos to try alongside the default. --oem 3
-# (LSTM, Tesseract's default) is pinned explicitly for clarity. --psm 3
-# ("fully automatic") assumes a page laid out in coherent blocks/columns;
-# poster graphics scatter short text fragments around illustrations with
-# no such structure, which can make automatic layout analysis miss them
-# entirely. --psm 6 ("single uniform block") suits a stacked caption like
-# "March / Women's / Day", while --psm 11 ("sparse text") looks for words
-# anywhere in the image in no particular order — between the three, most
-# poster layouts are covered.
-_OCR_CONFIGS = ("--oem 3", "--oem 3 --psm 6", "--oem 3 --psm 11")
+# Engine/page-segmentation combos to try alongside the default. --oem 1
+# (LSTM-only) is pinned explicitly rather than left at --oem 3 ("default,
+# based on what's available"): the hye/rus/eng traineddata this app
+# targets is LSTM-only on modern Tesseract, so the two behave identically
+# today, but pinning --oem 1 guarantees that instead of silently changing
+# behavior if a legacy-inclusive language pack (still shipped by some
+# Linux distros) ever ends up installed. --psm 3 ("fully automatic")
+# assumes a page laid out in coherent blocks/columns; poster graphics
+# scatter short text fragments around illustrations with no such
+# structure, which can make automatic layout analysis miss them entirely.
+# --psm 6 ("single uniform block") suits a stacked caption like "March /
+# Women's / Day", while --psm 11 ("sparse text") looks for words anywhere
+# in the image in no particular order — between the three, most poster
+# layouts are covered.
+_OCR_CONFIGS = ("--oem 1", "--oem 1 --psm 6", "--oem 1 --psm 11")
 
 
 def _ocr_candidate_images(raw_img: "Image.Image") -> List[tuple]:
@@ -686,8 +691,9 @@ def _full_text_score(text: str) -> int:
 
 # Full-page configs for the "trust Tesseract's own reading order" path —
 # --psm 11 (sparse text, no particular order) is deliberately excluded
-# here since it's the opposite of what a coherent document needs.
-_DOCUMENT_OCR_CONFIGS = ("--oem 3", "--oem 3 --psm 4", "--oem 3 --psm 6")
+# here since it's the opposite of what a coherent document needs. --oem 1
+# pinned for the same reason as _OCR_CONFIGS above.
+_DOCUMENT_OCR_CONFIGS = ("--oem 1", "--oem 1 --psm 4", "--oem 1 --psm 6")
 
 
 def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
@@ -734,7 +740,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     # before paying for either strategy's full multi-candidate cost.
     primary = _preprocess_for_ocr(raw_img)
     sx, sy = primary.width / raw_img.width, primary.height / raw_img.height
-    probe = _dedup_detections(_detections_from_candidate(primary, sx, sy, lang, "--oem 3", min_conf=40))
+    probe = _dedup_detections(_detections_from_candidate(primary, sx, sy, lang, "--oem 1", min_conf=40))
     if _looks_like_dense_document(_cluster_lines(probe)):
         # Trust Tesseract's own full-page reading-order reconstruction
         # instead of our merged-detection one: different renderings/
