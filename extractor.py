@@ -66,6 +66,16 @@ except Exception:
     np = None
 
 try:
+    # Optional: a trained document-layout model, used only as a
+    # pre-filter (see _mask_layout_noise below) to mask out figure/table
+    # regions before OCR. Not in requirements.txt — see
+    # requirements-doclayout.txt and the README for why (AGPL-3.0
+    # license, heavy dependency footprint).
+    from doclayout_yolo import YOLOv10
+except Exception:
+    YOLOv10 = None
+
+try:
     import openpyxl
 except Exception:
     openpyxl = None
@@ -734,7 +744,89 @@ def _looks_like_dense_document(lines: List[dict]) -> bool:
     return len(dense_lines) >= 5 and total_words >= 20
 
 
+_doclayout_model = None
+_doclayout_model_tried = False
+
+
+def _get_doclayout_model():
+    """Lazily load and cache the optional DocLayout-YOLO model.
+
+    Returns None — never raises — if the `doclayout-yolo` package isn't
+    installed, its weights can't be obtained (no DOCLAYOUT_MODEL_PATH and
+    no network access), or loading fails for any other reason. Cached in
+    a *two-state* way (a "tried" flag alongside the value, not just
+    checking `is None`) because None is also the legitimate "unavailable"
+    outcome — without the separate flag, every image would retry the
+    load (including a slow network timeout) rather than remembering it
+    already failed once.
+    """
+    global _doclayout_model, _doclayout_model_tried
+    if _doclayout_model_tried:
+        return _doclayout_model
+    _doclayout_model_tried = True
+
+    if YOLOv10 is None:
+        return None
+    try:
+        weights_path = os.getenv("DOCLAYOUT_MODEL_PATH")
+        if weights_path:
+            _doclayout_model = YOLOv10(weights_path)
+        else:
+            _doclayout_model = YOLOv10.from_pretrained("juliozhao/DocLayout-YOLO-DocStructBench")
+    except Exception:
+        _doclayout_model = None
+    return _doclayout_model
+
+
+# Classes (of DocStructBench's 10) worth masking out before OCR: real
+# illustration/tabular content that isn't text. Deliberately excludes
+# figure_caption/table_caption/table_footnote (those ARE text — masking
+# them would delete real content) and title/plain_text/abandoned_text
+# (exactly what should reach OCR). isolated_formula is left unmasked too:
+# formulas aren't a requested target and the false-masking risk isn't
+# worth it for an unrequested class.
+_DOCLAYOUT_MASK_CLASSES = {"figure", "table"}
+_DOCLAYOUT_MASK_CONF = 0.25
+
+
+def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
+    """Best-effort: if DocLayout-YOLO is available, detect figure/table
+    regions and mask them white before OCR, so illustration noise can't
+    confuse text detection — attacking the "busy image confuses OCR"
+    problem at the source instead of filtering noise out after the fact.
+
+    Returns img unchanged (never raises) on any failure, missing
+    dependency, or when nothing meets the mask criteria.
+    """
+    model = _get_doclayout_model()
+    if model is None or cv2 is None or np is None:
+        return img
+
+    try:
+        rgb = img.convert("RGB")
+        results = model.predict(rgb, imgsz=1024, conf=_DOCLAYOUT_MASK_CONF, device="cpu", verbose=False)
+        boxes = []
+        for result in results:
+            names = result.names
+            for box in result.boxes:
+                cls_name = names[int(box.cls[0])]
+                if cls_name in _DOCLAYOUT_MASK_CLASSES and float(box.conf[0]) >= _DOCLAYOUT_MASK_CONF:
+                    x0, y0, x1, y1 = box.xyxy[0].tolist()
+                    boxes.append((int(x0), int(y0), int(x1), int(y1)))
+
+        if not boxes:
+            return img
+
+        arr = np.array(rgb)
+        for x0, y0, x1, y1 in boxes:
+            arr[max(0, y0):y1, max(0, x0):x1] = 255
+        return Image.fromarray(arr)
+    except Exception:
+        return img
+
+
 def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
+    raw_img = _mask_layout_noise(raw_img)
     # Cheap single-pass probe (one rendering, one config) to tell a normal
     # dense document apart from scattered poster/graphic-style text,
     # before paying for either strategy's full multi-candidate cost.
@@ -775,6 +867,7 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     pages = convert_from_path(str(path), poppler_path=POPPLER_PATH)
     out_lines = []
     for i, page in enumerate(pages, start=1):
+        page = _mask_layout_noise(page)
         txt = pytesseract.image_to_string(_preprocess_for_ocr(page), lang=lang)
         out_lines.append(f"\n--- PAGE {i} ---\n")
         out_lines.append(txt)

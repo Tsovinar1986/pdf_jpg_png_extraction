@@ -10,6 +10,7 @@ Features
 - XLSX/XLSM, DOCX, CSV, and TXT are read directly (not OCR'd) — spreadsheets are converted to tab-separated text per sheet, DOCX paragraphs/tables are read as-is.
 - Extract embedded images out of a PDF/XLSX/DOCX, or the image itself for a plain image upload, as downloadable PNGs.
 - Web UI (FastAPI backend + static frontend) with drag-and-drop upload, extracted-text panel, and an image gallery.
+- Optional: a trained document-layout model (DocLayout-YOLO) can pre-filter out illustration/table regions before OCR — off by default, see [Optional: DocLayout-YOLO pre-filter](#optional-doclayout-yolo-pre-filter-agpl-30) below.
 
 Installation
 ------------
@@ -68,6 +69,26 @@ py -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+### Optional: DocLayout-YOLO pre-filter (AGPL-3.0)
+
+A trained document-layout model that can detect figure/table regions and mask them out before OCR runs, reducing the chance a busy illustration confuses text detection on documents with mixed text and graphics. **Off by default** — extraction works exactly the same without it, no error, no behavior change.
+
+> **License warning**: `doclayout-yolo` is licensed under **AGPL-3.0**, a strong-copyleft license with a network-use clause — if you modify this app and run it as a hosted/network service, AGPL-3.0 requires you to publish the complete corresponding source of your modified version to those users. That's a materially different obligation than this project's other dependencies (all permissive-licensed). Don't enable this feature in a hosted deployment without first confirming your license compliance obligations; if in doubt, don't install it.
+
+It's also a large dependency — pulls in PyTorch and related packages (hundreds of MB), well beyond this project's normal footprint. Install separately, not part of `requirements.txt`:
+
+```sh
+pip install -r requirements-doclayout.txt
+```
+
+By default the ~41MB model checkpoint auto-downloads from Hugging Face on first use (cached in `~/.cache/huggingface`). To use a manually-downloaded checkpoint instead (e.g. for offline/air-gapped use), set:
+
+```sh
+export DOCLAYOUT_MODEL_PATH=/path/to/doclayout_yolo_docstructbench_imgsz1024.pt
+```
+
+Trained on scientific-paper-style document layouts, so expect it to help most on dense text pages (books, reports, forms) with embedded figures/tables, and to have little or no effect on posters, memes, or chat screenshots — those aren't the kind of layout it was trained on. Not baked into the Docker image by default; if you want it there, add `requirements-doclayout.txt` to a custom build.
 
 CLI usage
 ---------

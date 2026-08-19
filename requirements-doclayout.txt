@@ -1,0 +1,19 @@
+# Optional pre-filter, NOT part of the default install (pip install -r
+# requirements.txt does not include this file — install it separately).
+#
+# doclayout-yolo is licensed under AGPL-3.0, a strong-copyleft license
+# with a network-use clause: if you run a modified version of this app
+# as a hosted/network service, AGPL-3.0 requires you to publish the
+# complete corresponding source of that modified version. This is a
+# materially different obligation than every other dependency in this
+# project. Read the "Optional: DocLayout-YOLO pre-filter" section in the
+# README before installing this in anything you intend to host.
+#
+# It also pulls in torch, torchvision, opencv-python (a second, GUI-
+# linked OpenCV build alongside opencv-python-headless already in
+# requirements.txt), albumentations, pandas, matplotlib, and scipy —
+# hundreds of MB, a large jump from this project's normal footprint.
+#
+#   pip install -r requirements.txt -r requirements-doclayout.txt
+#
+doclayout-yolo
