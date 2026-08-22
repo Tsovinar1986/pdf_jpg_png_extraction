@@ -480,7 +480,20 @@ def _ocr_candidate_images(raw_img: "Image.Image") -> List[tuple]:
     sx, sy = pil_pre.width / raw_img.width, pil_pre.height / raw_img.height
     threshold = _otsu_threshold(pil_pre)
     binarized = pil_pre.point(lambda p: 255 if p > threshold else 0)
+    # Every candidate below goes through at least autocontrast + unsharp
+    # mask (_preprocess_for_ocr) — necessary rescue for a noisy real-world
+    # scan, but confirmed to actively *hurt* an already-clean image: on a
+    # sharp, high-contrast synthetic Armenian test page, the unenhanced
+    # original round-tripped through Tesseract's "hye" model far more
+    # accurately than any processed variant did (extra characters and
+    # dropped words appeared only after processing). Armenian glyphs seem
+    # more sensitive to this than Latin/Cyrillic, where the processed
+    # candidates still won cleanly in the same test — so rather than
+    # special-case the language, just always offer the genuinely
+    # untouched original as one more candidate and let the existing
+    # highest-score-wins comparison pick it when it's actually better.
     candidates = [
+        (raw_img.convert("RGB"), 1.0, 1.0),
         (pil_pre, sx, sy),
         (ImageOps.invert(pil_pre), sx, sy),
         (binarized, sx, sy),
@@ -858,22 +871,72 @@ def _word_count(text: str) -> int:
 _DOCUMENT_OCR_CONFIGS = ("--oem 1", "--oem 1 --psm 4", "--oem 1 --psm 6")
 
 
+def _text_from_word_data(data: dict) -> str:
+    """Reconstruct text from image_to_data's word-level output, preserving
+    Tesseract's own block/paragraph/line structure — a faithful stand-in
+    for image_to_string's serialization, not a different reading-order
+    reconstruction, so the "trust Tesseract's own reading order" property
+    _best_full_page_text relies on still holds."""
+    out_lines: List[str] = []
+    current_line: List[str] = []
+    prev_key = None
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if prev_key is not None and key != prev_key:
+            out_lines.append(" ".join(current_line))
+            if key[:2] != prev_key[:2]:
+                out_lines.append("")
+            current_line = []
+        current_line.append(word)
+        prev_key = key
+    if current_line:
+        out_lines.append(" ".join(current_line))
+    return "\n".join(out_lines)
+
+
+def _mean_word_confidence(data: dict) -> float:
+    confs = [float(c) for c, w in zip(data["conf"], data["text"]) if w.strip() and float(c) >= 0]
+    return sum(confs) / len(confs) if confs else -1.0
+
+
 def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
     """Full-page OCR that trusts Tesseract's own built-in reading-order
     reconstruction, trying each candidate rendering/config and keeping
-    whichever recognized the most real words.
+    whichever Tesseract is actually most confident about.
+
+    Not the same as "recognized the most word-shaped characters" — a
+    heavily processed candidate can hallucinate extra glyphs that still
+    look like real words, inflating a plain word-character-count score,
+    while scoring far lower on Tesseract's own per-character confidence
+    (confirmed on a real case: a garbled candidate won the old
+    character-count comparison outright while sitting ~20 points below
+    every other candidate's mean confidence). Candidates that recognize
+    much less text than the fullest candidate are excluded first so a
+    sparse-but-confident read (e.g. one easy word) can't beat a complete
+    page merely by having fewer chances to be wrong.
     """
-    best_text, best_score = "", -1
+    results = []
     for candidate, _sx, _sy in _ocr_candidate_images(raw_img):
         for config in _DOCUMENT_OCR_CONFIGS:
             try:
-                text = pytesseract.image_to_string(candidate, lang=lang, config=config)
+                data = pytesseract.image_to_data(candidate, lang=lang, config=config, output_type=pytesseract.Output.DICT)
             except Exception:
                 continue
-            score = _full_text_score(text)
-            if score > best_score:
-                best_text, best_score = text, score
-    return best_text
+            word_count = sum(1 for w in data["text"] if w.strip())
+            if word_count == 0:
+                continue
+            results.append((_mean_word_confidence(data), word_count, data))
+
+    if not results:
+        return ""
+
+    max_words = max(r[1] for r in results)
+    complete_enough = [r for r in results if r[1] >= max_words * 0.7]
+    best_conf, _best_words, best_data = max(complete_enough, key=lambda r: r[0])
+    return _text_from_word_data(best_data)
 
 
 def _looks_like_dense_document(lines: List[dict]) -> bool:
