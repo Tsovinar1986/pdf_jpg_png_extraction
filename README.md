@@ -90,6 +90,10 @@ export DOCLAYOUT_MODEL_PATH=/path/to/doclayout_yolo_docstructbench_imgsz1024.pt
 
 Trained on scientific-paper-style document layouts, so expect it to help most on dense text pages (books, reports, forms) with embedded figures/tables, and to have little or no effect on posters, memes, or chat screenshots — those aren't the kind of layout it was trained on. Not baked into the Docker image by default; if you want it there, add `requirements-doclayout.txt` to a custom build.
 
+### Automatic: deskew
+
+Scans and phone photos of book pages are often rotated a few degrees off horizontal, which measurably hurts OCR accuracy. The pipeline detects this automatically (from the aggregate shape of the page's ink pixels) and straightens it before OCR — no flag needed, and it's a no-op (returns the image unchanged) on already-straight pages or when OpenCV isn't installed. This corrects rotational skew only, not the 2D curl a page picks up near a book's spine — that needs a full page-dewarping model and isn't implemented here.
+
 CLI usage
 ---------
 

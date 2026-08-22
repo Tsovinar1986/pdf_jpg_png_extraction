@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import List, Optional
 
@@ -236,6 +237,55 @@ def _looks_like_text(word: str) -> bool:
     return len(word) >= 2
 
 
+# Rough per-script letter ranges, just enough to tell Armenian/Cyrillic/Latin
+# apart for the stray-glyph filter below — not a full script classifier.
+_SCRIPT_RANGES = {
+    "armenian": re.compile(r"[԰-֏]"),
+    "cyrillic": re.compile(r"[Ѐ-ӿ]"),
+    "latin": re.compile(r"[A-Za-zÀ-ɏ]"),
+}
+
+
+def _dominant_script(word: str) -> Optional[str]:
+    counts = {name: len(pat.findall(word)) for name, pat in _SCRIPT_RANGES.items()}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else None
+
+
+def _strip_stray_script_glyphs(text: str) -> str:
+    """Drop short (<=2 char) word-tokens whose script doesn't match the
+    rest of their line.
+
+    A single misread glyph — a decorative flourish, a border/divider
+    element, noise near a color transition — can land on an otherwise
+    clean line of real text and pass every other filter (it has a real
+    letter). When that stray glyph happens to be recognized in a
+    *different* script than every real word around it (e.g. one Armenian
+    letter tacked onto an English caption because the OCR language pack
+    covers both), that mismatch is itself strong evidence it's not real
+    content — genuine short loanwords in a foreign script are far rarer
+    than this specific misread pattern. Longer tokens carry enough of
+    their own evidence to stand on their own and are left untouched.
+
+    Applied as a final text-level pass (not inside the word-box
+    reconstruction) so it works regardless of which OCR reconstruction
+    produced the text — Tesseract's own full-page serialization, or this
+    module's word-box reconstruction.
+    """
+    out_lines = []
+    for line in text.split("\n"):
+        tokens = line.split(" ")
+        scripts = [_dominant_script(t) for t in tokens if len(t) >= 3]
+        scripts = [s for s in scripts if s]
+        if not scripts:
+            out_lines.append(line)
+            continue
+        dominant = Counter(scripts).most_common(1)[0][0]
+        kept = [t for t in tokens if len(t) > 2 or _dominant_script(t) in (dominant, None)]
+        out_lines.append(" ".join(kept))
+    return "\n".join(out_lines)
+
+
 def _box_iou(a: tuple, b: tuple) -> float:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -268,6 +318,24 @@ def _boxes_compete(a: tuple, b: tuple) -> bool:
     overlap_x = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
     smaller_w = min(aw, bw)
     return smaller_w > 0 and overlap_x / smaller_w > 0.5
+
+
+def _box_mostly_within(inner: tuple, outer: tuple) -> bool:
+    """Whether most of `inner`'s own area falls inside `outer`.
+
+    Unlike _boxes_compete (built for comparing two same-scale word-line
+    boxes, with a "same line" gate that assumes both are line-height),
+    this is for checking a small detection against a much taller region —
+    a detection near the bottom of a tall region can be legitimately
+    inside it while still being hundreds of pixels from the region's own
+    top edge, which would fail _boxes_compete's line-height-relative gate.
+    """
+    ix, iy, iw, ih = inner
+    ox, oy, ow, oh = outer
+    overlap_x = max(0.0, min(ix + iw, ox + ow) - max(ix, ox))
+    overlap_y = max(0.0, min(iy + ih, oy + oh) - max(iy, oy))
+    inner_area = max(1e-6, iw * ih)
+    return (overlap_x * overlap_y) / inner_area > 0.5
 
 
 def _otsu_threshold(gray_img: "Image.Image") -> int:
@@ -494,6 +562,82 @@ def _dedup_detections(detections: List[tuple]) -> List[tuple]:
     return kept
 
 
+def _split_merged_word_detection(raw_img: "Image.Image", det: tuple, lang: str) -> List[tuple]:
+    """If a single detected word's box has an internal ink gap wide enough
+    to be a real inter-word space, split it into two detections there.
+
+    Targets a failure mode the line-level space-*joining* elsewhere in
+    this module can't reach: Tesseract's own word segmentation
+    occasionally merges two visually-close words — tight kerning, an
+    italic slant bridging the visual gap — into a single box to begin
+    with, so there's no second detection to join a space onto; the fix
+    has to come from the box's own pixels. Confirmed reproducible: two
+    words rendered with a 1px gap in a bold italic font come back from
+    Tesseract as one merged word ("Commentary"+"on" -> "Commentaryon"),
+    while the same words at a 4px+ gap come back correctly split.
+
+    Returns [det] unchanged whenever nothing meets the bar: word too
+    short to bother, no numpy for the pixel analysis, no gap found, or a
+    re-OCR of either half fails to produce plausible text — a failed
+    split must never be worse than leaving the original merged word.
+    """
+    box, conf, word, support = det
+    x, y, w, h = box
+    if len(word) < 6 or h < 8 or np is None or pytesseract is None:
+        return [det]
+
+    crop = raw_img.crop((int(x), int(y), int(x + w), int(y + h))).convert("L")
+    threshold = _otsu_threshold(crop)
+    arr = np.array(crop)
+    binarized = arr < threshold
+    # Otsu doesn't know which side of the cutoff is ink vs. background;
+    # assume ink is the minority class — true for any normal word crop,
+    # where letters cover less area than the space around them.
+    if binarized.sum() > binarized.size / 2:
+        binarized = ~binarized
+
+    col_ink = binarized.sum(axis=0)
+    cw = col_ink.shape[0]
+    margin = max(2, int(cw * 0.12))
+    min_gap = max(3, int(h * 0.35))
+
+    best_mid, best_width, run_start = None, 0, None
+    for i in range(margin, cw - margin):
+        if col_ink[i] == 0:
+            if run_start is None:
+                run_start = i
+        elif run_start is not None:
+            run_len = i - run_start
+            if run_len >= min_gap and run_len > best_width:
+                best_width, best_mid = run_len, (run_start + i) // 2
+            run_start = None
+    if run_start is not None:
+        run_len = (cw - margin) - run_start
+        if run_len >= min_gap and run_len > best_width:
+            best_mid = (run_start + cw - margin) // 2
+
+    if best_mid is None:
+        return [det]
+
+    left_crop = raw_img.crop((int(x), int(y), int(x + best_mid), int(y + h)))
+    right_crop = raw_img.crop((int(x + best_mid), int(y), int(x + w), int(y + h)))
+    try:
+        left_text = pytesseract.image_to_string(left_crop, lang=lang, config="--oem 1 --psm 7").strip()
+        right_text = pytesseract.image_to_string(right_crop, lang=lang, config="--oem 1 --psm 7").strip()
+    except Exception:
+        return [det]
+
+    if not (left_text and right_text and _looks_like_text(left_text) and _looks_like_text(right_text)):
+        return [det]
+    if _REPEATED_CHAR_RE.search(left_text) or _REPEATED_CHAR_RE.search(right_text):
+        return [det]
+
+    return [
+        ((x, y, best_mid, h), conf, left_text, support),
+        ((x + best_mid, y, w - best_mid, h), conf, right_text, support),
+    ]
+
+
 def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) -> List[tuple]:
     """Run every candidate rendering × page-segmentation config and return
     every accepted (box, conf, word) detection, in raw_img's own pixel
@@ -511,7 +655,11 @@ def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) 
     for candidate, sx, sy in _ocr_candidate_images(raw_img):
         for config in _OCR_CONFIGS:
             detections.extend(_detections_from_candidate(candidate, sx, sy, lang, config, min_conf))
-    return _dedup_detections(detections)
+    deduped = _dedup_detections(detections)
+    split_out = []
+    for det in deduped:
+        split_out.extend(_split_merged_word_detection(raw_img, det, lang))
+    return split_out
 
 
 def _cluster_lines(detections: List[tuple]) -> List[dict]:
@@ -699,6 +847,10 @@ def _full_text_score(text: str) -> int:
     return sum(len(w) for w in _WORD_RE.findall(text))
 
 
+def _word_count(text: str) -> int:
+    return len(_WORD_RE.findall(text))
+
+
 # Full-page configs for the "trust Tesseract's own reading order" path —
 # --psm 11 (sparse text, no particular order) is deliberately excluded
 # here since it's the opposite of what a coherent document needs. --oem 1
@@ -789,6 +941,61 @@ _DOCLAYOUT_MASK_CLASSES = {"figure", "table"}
 _DOCLAYOUT_MASK_CONF = 0.25
 
 
+# Below this, the correction is noise (sub-pixel jitter from the angle
+# estimate itself), not real skew — skip the interpolation blur of rotating
+# an already-straight page. Above this, the estimate is more likely a
+# misdetection on non-text content (illustrations, borders) than real scan
+# skew, which is rarely more than a few degrees — so it's left uncorrected
+# rather than risk rotating a poster/graphic based on a bogus angle.
+_DESKEW_MIN_ANGLE = 0.3
+_DESKEW_MAX_ANGLE = 15.0
+
+
+def _deskew(img: "Image.Image") -> "Image.Image":
+    """Straighten a page that's rotated a few degrees off horizontal —
+    common with phone photos of book pages and slightly crooked scans.
+
+    Estimates the skew angle from the minimum-area bounding rectangle of
+    all ink pixels (a page of text is, in aggregate, a long thin rotated
+    rectangle) and rotates it back to horizontal. This corrects *rotation*
+    only — not the 2D curl a page picks up near a book's spine, which needs
+    a full page-dewarping model and is out of scope here; rotational skew
+    is the far more common failure mode and the one cheap to fix locally.
+
+    Returns img unchanged (never raises) on any failure, missing
+    dependency, or when the estimated angle is outside the trusted range.
+    """
+    if cv2 is None or np is None:
+        return img
+
+    try:
+        rgb = img.convert("RGB")
+        arr = np.array(rgb)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        coords = cv2.findNonZero(binary)
+        if coords is None or len(coords) < 100:
+            return img
+
+        angle = cv2.minAreaRect(coords)[-1]
+        # cv2.minAreaRect reports an angle in (-90, 0]; anything past -45
+        # means it measured the rectangle's long side as vertical instead
+        # of horizontal — rotate the other way to still land on horizontal.
+        if angle < -45:
+            angle = 90 + angle
+
+        if abs(angle) < _DESKEW_MIN_ANGLE or abs(angle) > _DESKEW_MAX_ANGLE:
+            return img
+
+        h, w = gray.shape
+        matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        rotated = cv2.warpAffine(arr, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return Image.fromarray(rotated)
+    except Exception:
+        return img
+
+
 def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
     """Best-effort: if DocLayout-YOLO is available, detect figure/table
     regions and mask them white before OCR, so illustration noise can't
@@ -825,6 +1032,145 @@ def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
         return img
 
 
+def _recover_rotated_sidebar_text(raw_img: "Image.Image", covered_boxes: List[tuple], lang: str) -> List[tuple]:
+    """Best-effort recovery of vertical/rotated text — a spine-style
+    sidebar caption, a rotated stamp — that normal horizontal OCR doesn't
+    just miss but actively misreads as scrambled/mirrored nonsense:
+    recognizable letterforms in the wrong orientation still get "read",
+    just garbled (confirmed reproducible: a vertical "PHILOSOPHIA ANTIQUA
+    - VOLUME 137" sidebar comes back from horizontal OCR as fragments like
+    "VIHdOSOTIHd" and "AINNIOA" — mirrored/reversed letter shapes, which
+    without this function land as noise *inside* the main text, not just
+    a gap where the sidebar should be) — so a plausibility filter on the
+    normal pass alone won't catch it.
+
+    Scans for narrow vertical bands with substantial ink that isn't
+    explained by any already-detected text box, crops each, retries OCR
+    at +90/-90 degrees, and keeps whichever rotation (if either) produces
+    plausible multi-word text. Returns a list of (region_box, text) pairs
+    — empty on any failure, missing dependency, or when no such band is
+    found; this is a bonus recovery on top of the normal pipeline, never a
+    requirement for it. The region box lets the caller also drop that
+    area's original horizontal-orientation misreads out of the main
+    detections, instead of just adding the recovered text alongside them.
+    """
+    if cv2 is None or np is None or pytesseract is None:
+        return []
+    try:
+        rgb = raw_img.convert("RGB")
+        gray = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2GRAY)
+        threshold = _otsu_threshold(Image.fromarray(gray))
+        ink = (gray < threshold).astype("uint8")
+        # Otsu doesn't know which side is ink; assume it's the minority
+        # class over the whole page (true for any normal document/poster).
+        if ink.sum() > ink.size / 2:
+            ink = 1 - ink
+
+        # Letters are thin, sparse strokes — even inside a solid block of
+        # text, ink covers only a small fraction of the bounding region's
+        # pixels. A vertical-biased dilation bridges those strokes into a
+        # continuous column blob so a straightforward density scan can
+        # find it; without it, real text's own per-column ink density is
+        # too low to distinguish from noise at any usable threshold.
+        dilated = cv2.dilate(ink, np.ones((21, 5), np.uint8), iterations=1).astype(bool)
+
+        h, w = gray.shape
+        covered = np.zeros((h, w), dtype="uint8")
+        for (x, y, bw, bh) in covered_boxes:
+            x0, y0 = max(0, int(x)), max(0, int(y))
+            x1, y1 = min(w, int(x + bw)), min(h, int(y + bh))
+            covered[y0:y1, x0:x1] = 1
+        # Pad the coverage mask too, since the dilation above spreads a
+        # detected word's own ink beyond its tight bounding box.
+        covered = cv2.dilate(covered, np.ones((5, 5), np.uint8), iterations=1).astype(bool)
+
+        uncovered = dilated & ~covered
+        col_density = uncovered.sum(axis=0) / max(1, h)
+
+        # A genuine vertical text band has ink sustained over a large
+        # fraction of the page height, concentrated in a narrow column
+        # range — unlike scattered decorative noise elsewhere on the page.
+        candidate_cols = np.where(col_density > 0.08)[0]
+        if candidate_cols.size == 0:
+            return []
+
+        # Merge nearby candidate columns into one run generously: a single
+        # physical vertical text band can show small x-gaps between its
+        # own rotated letters (individual glyph widths vary), and treating
+        # those as separate regions would only recognize one fragment
+        # while leaving the rest of the same band's horizontal-orientation
+        # noise undetected and unexcluded from the main text.
+        runs = []
+        run_start = prev = candidate_cols[0]
+        for c in candidate_cols[1:]:
+            if c - prev > 25:
+                runs.append((run_start, prev))
+                run_start = c
+            prev = c
+        runs.append((run_start, prev))
+
+        results = []
+        for x0, x1 in runs:
+            if not (10 <= x1 - x0 <= w * 0.25):
+                continue
+            rows = np.where(uncovered[:, x0:x1 + 1].any(axis=1))[0]
+            if rows.size == 0 or rows.max() - rows.min() < h * 0.15:
+                continue
+            y0, y1 = int(rows.min()), int(rows.max())
+            pad = 4
+            region_box = (max(0, x0 - pad), max(0, y0 - pad), (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+            crop = rgb.crop((region_box[0], region_box[1], region_box[0] + region_box[2], region_box[1] + region_box[3]))
+
+            # +90 vs -90 both recognize real letterforms — one direction
+            # just reads them upside-down/mirrored, producing text that's
+            # equally plausible by shape/length/word-count alone (see
+            # "PHILOSOPHIA ANTIQUA" vs. its mirrored "VIHdOSOTIHd" reading,
+            # both 5 space-separated tokens). Tesseract's own recognition
+            # confidence is what actually tells them apart: it's
+            # consistently much higher on the correctly-oriented reading.
+            best_text, best_conf = None, 0.0
+            for angle in (90, -90):
+                try:
+                    data = pytesseract.image_to_data(
+                        crop.rotate(angle, expand=True), lang=lang, config="--oem 1 --psm 6",
+                        output_type=pytesseract.Output.DICT,
+                    )
+                except Exception:
+                    continue
+                words = [w for w in data["text"] if w.strip()]
+                text = " ".join(words)
+                confs = [float(c) for c, w in zip(data["conf"], data["text"]) if w.strip() and float(c) >= 0]
+                avg_conf = sum(confs) / len(confs) if confs else 0.0
+                if (
+                    len(words) >= 2 and not _REPEATED_CHAR_RE.search(text)
+                    and avg_conf > best_conf and avg_conf >= _MIN_TRUSTED_CONFIDENCE
+                ):
+                    best_text, best_conf = text, avg_conf
+            if best_text:
+                results.append((region_box, best_text))
+        return results
+    except Exception:
+        return []
+
+
+def _exclude_sidebar_noise(detections: List[tuple], sidebar_results: List[tuple]) -> List[tuple]:
+    """Drop detections that fall mostly inside a recovered rotated-sidebar
+    region — see _recover_rotated_sidebar_text: those detections are the
+    horizontal-orientation misreads of the same content, not separate real
+    words, and would otherwise sit in the output alongside the correct
+    recovered reading."""
+    if not sidebar_results:
+        return detections
+    recovered_boxes = [rb for rb, _ in sidebar_results]
+    return [d for d in detections if not any(_box_mostly_within(d[0], rb) for rb in recovered_boxes)]
+
+
+def _append_sidebar_text(text: str, sidebar_results: List[tuple]) -> str:
+    if not sidebar_results:
+        return text
+    return "\n\n".join([text] + [t for _, t in sidebar_results])
+
+
 def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     raw_img = _mask_layout_noise(raw_img)
     # Cheap single-pass probe (one rendering, one config) to tell a normal
@@ -834,19 +1180,51 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     sx, sy = primary.width / raw_img.width, primary.height / raw_img.height
     probe = _dedup_detections(_detections_from_candidate(primary, sx, sy, lang, "--oem 1", min_conf=40))
     if _looks_like_dense_document(_cluster_lines(probe)):
-        # Trust Tesseract's own full-page reading-order reconstruction
-        # instead of our merged-detection one: different renderings/
-        # configs yield slightly different word boxes for the same text,
-        # and stitching several of them back into lines can scramble
-        # reading order or drop a word that lost a confidence tie-break —
-        # a real, observed failure mode on long wrapped paragraphs, and
-        # not a risk worth taking once the page is clearly normal
-        # multi-line text.
-        return _best_full_page_text(raw_img, lang)
+        # Trust Tesseract's own full-page reading-order reconstruction by
+        # default: different renderings/configs yield slightly different
+        # word boxes for the same text, and stitching several of them back
+        # into lines can scramble reading order or drop a word that lost a
+        # confidence tie-break — a real, observed failure mode on long
+        # wrapped paragraphs.
+        trusted_text = _best_full_page_text(raw_img, lang)
+
+        # But cross-check it against the word-box reconstruction, which
+        # structurally can't reproduce Tesseract's other common failure on
+        # multi-column tables: image_to_string's own line/paragraph
+        # serialization sometimes drops the space at a column or cell
+        # boundary, gluing the last word of one cell to the first word of
+        # the next (each word was individually recognized correctly — only
+        # the space between them got lost). Joining each detected word with
+        # an explicit space can't lose a space that way. If the box
+        # reconstruction recovers meaningfully more words while covering at
+        # least as much recognized text, the trusted path likely lost some
+        # spaces — prefer the version that kept them.
+        detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
+        # Check for a rotated sidebar/spine caption before the dominant-
+        # block filter narrows things down — "already explained by a real
+        # detection" should include everything found, not just what the
+        # stricter dominant-block bar kept. Note this only cleans the
+        # *boxed* reconstruction below; if `trusted_text` (Tesseract's own
+        # full-page string, with no per-word boxes to filter) wins the
+        # comparison instead, any inline sidebar misreads there aren't
+        # removed — only the recovered text gets appended either way.
+        sidebar_results = _recover_rotated_sidebar_text(raw_img, [d[0] for d in detections], lang)
+        detections = _exclude_sidebar_noise(detections, sidebar_results)
+        detections = _prefer_dominant_paragraph_block(detections)
+        boxed_text = _detections_to_text(detections)
+
+        trusted_words, trusted_chars = _word_count(trusted_text), _full_text_score(trusted_text)
+        boxed_words, boxed_chars = _word_count(boxed_text), _full_text_score(boxed_text)
+        text = boxed_text if (boxed_words > trusted_words * 1.15 and boxed_chars >= trusted_chars * 0.9) else trusted_text
+        text = _strip_stray_script_glyphs(text)
+        return _append_sidebar_text(text, sidebar_results)
 
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
+    sidebar_results = _recover_rotated_sidebar_text(raw_img, [d[0] for d in detections], lang)
+    detections = _exclude_sidebar_noise(detections, sidebar_results)
     detections = _prefer_dominant_paragraph_block(detections)
-    return _detections_to_text(detections)
+    text = _strip_stray_script_glyphs(_detections_to_text(detections))
+    return _append_sidebar_text(text, sidebar_results)
 
 
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
@@ -867,8 +1245,17 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     pages = convert_from_path(str(path), poppler_path=POPPLER_PATH)
     out_lines = []
     for i, page in enumerate(pages, start=1):
-        page = _mask_layout_noise(page)
-        txt = pytesseract.image_to_string(_preprocess_for_ocr(page), lang=lang)
+        # Route through the same pipeline direct image uploads use
+        # (multi-candidate rendering/config search, dense-vs-sparse
+        # routing, stray-script-glyph filtering, in-box merged-word
+        # splitting, rotated-sidebar recovery) rather than one plain OCR
+        # pass — a scanned page can have exactly the same table/cover/
+        # sidebar layouts a standalone image upload does, and there's no
+        # reason those fixes should only apply to one of this app's two
+        # OCR entry points. _mask_layout_noise runs inside _ocr_best_of;
+        # only deskew needs to happen first, here.
+        page = _deskew(page)
+        txt = _ocr_best_of(page, lang)
         out_lines.append(f"\n--- PAGE {i} ---\n")
         out_lines.append(txt)
     return "\n".join(out_lines)
@@ -882,6 +1269,7 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # with "file in use by another process".
     lang = _resolve_ocr_langs(lang)
     with Image.open(path) as img:
+        img = _deskew(img)
         return _ocr_best_of(img, lang)
 
 
