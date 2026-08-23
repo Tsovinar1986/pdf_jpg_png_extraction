@@ -984,23 +984,42 @@ def _get_doclayout_model():
         return None
     try:
         weights_path = os.getenv("DOCLAYOUT_MODEL_PATH")
-        if weights_path:
-            _doclayout_model = YOLOv10(weights_path)
-        else:
-            _doclayout_model = YOLOv10.from_pretrained("juliozhao/DocLayout-YOLO-DocStructBench")
+        if not weights_path:
+            # YOLOv10.from_pretrained() delegates to huggingface_hub's
+            # PyTorchModelHubMixin, which expects a config.json describing
+            # the checkpoint filename to fetch. This repo has none — just
+            # the bare .pt file — so that auto-resolution silently falls
+            # back to a hardcoded default ("yolov10n.pt") that doesn't
+            # exist, raising FileNotFoundError (confirmed against both
+            # huggingface_hub 1.x and 0.x). hf_hub_download() fetches the
+            # exact named file directly, the same reliable, cached-in-
+            # ~/.cache/huggingface mechanism the README already documents,
+            # sidestepping the broken auto-resolution entirely.
+            from huggingface_hub import hf_hub_download
+            weights_path = hf_hub_download(
+                repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
+                filename="doclayout_yolo_docstructbench_imgsz1024.pt",
+            )
+        _doclayout_model = YOLOv10(weights_path)
     except Exception:
         _doclayout_model = None
     return _doclayout_model
 
 
 # Classes (of DocStructBench's 10) worth masking out before OCR: real
-# illustration/tabular content that isn't text. Deliberately excludes
+# illustration content that isn't text. Deliberately excludes
 # figure_caption/table_caption/table_footnote (those ARE text — masking
 # them would delete real content) and title/plain_text/abandoned_text
 # (exactly what should reach OCR). isolated_formula is left unmasked too:
 # formulas aren't a requested target and the false-masking risk isn't
-# worth it for an unrequested class.
-_DOCLAYOUT_MASK_CLASSES = {"figure", "table"}
+# worth it for an unrequested class. "table" is deliberately excluded
+# too, despite the class name: confirmed on a real bilingual vocabulary
+# table that a detected "table" region is the table's *cell content*
+# area, which routinely contains exactly the real text a table upload is
+# for — masking it white before OCR destroyed the entire table's text
+# outright, not just its gridlines/borders. Only genuine illustration
+# content ("figure") has no text worth preserving.
+_DOCLAYOUT_MASK_CLASSES = {"figure"}
 _DOCLAYOUT_MASK_CONF = 0.25
 
 
@@ -1074,22 +1093,73 @@ def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
 
     try:
         rgb = img.convert("RGB")
+        page_area = rgb.width * rgb.height
         results = model.predict(rgb, imgsz=1024, conf=_DOCLAYOUT_MASK_CONF, device="cpu", verbose=False)
-        boxes = []
+
+        mask_candidates: List[tuple] = []
+        text_boxes: List[tuple] = []
         for result in results:
             names = result.names
             for box in result.boxes:
+                if float(box.conf[0]) < _DOCLAYOUT_MASK_CONF:
+                    continue
                 cls_name = names[int(box.cls[0])]
-                if cls_name in _DOCLAYOUT_MASK_CLASSES and float(box.conf[0]) >= _DOCLAYOUT_MASK_CONF:
-                    x0, y0, x1, y1 = box.xyxy[0].tolist()
-                    boxes.append((int(x0), int(y0), int(x1), int(y1)))
+                coords = tuple(int(v) for v in box.xyxy[0].tolist())
+                (mask_candidates if cls_name in _DOCLAYOUT_MASK_CLASSES else text_boxes).append(coords)
+
+        def _overlaps_real_text(box: tuple) -> bool:
+            x0, y0, x1, y1 = box
+            box_area = max(1, (x1 - x0) * (y1 - y0))
+            for tx0, ty0, tx1, ty1 in text_boxes:
+                iw = max(0, min(x1, tx1) - max(x0, tx0))
+                ih = max(0, min(y1, ty1) - max(y0, ty0))
+                if (iw * ih) / box_area > 0.5:
+                    return True
+            return False
+
+        boxes = []
+        for x0, y0, x1, y1 in mask_candidates:
+            # A genuine illustration is normally a discrete portion of
+            # a page, not nearly the whole thing — confirmed on a
+            # densely illuminated manuscript page, where the model's
+            # own low-confidence "figure" detections span almost the
+            # entire page (ornate borders + text intermixed confusing
+            # the classifier) and masking them wiped out the one
+            # actual text column along with the decoration, losing
+            # everything instead of just the noise. A box this large
+            # is more likely swallowing real content than isolating a
+            # true illustration, so it's left unmasked.
+            if (x1 - x0) * (y1 - y0) > page_area * 0.6:
+                continue
+            # The model can label the *same* region both a real text
+            # class and "figure" at once — confirmed on a poster with a
+            # decorative drop-shadow font on a solid color background,
+            # which visually reads as graphic-like enough to get a
+            # contradicting "figure" tag over the same spot as a "plain
+            # text" one. Masking the figure tag there deleted the page's
+            # only real text outright; a substantially-overlapping text
+            # detection is direct evidence against the figure label.
+            if _overlaps_real_text((x0, y0, x1, y1)):
+                continue
+            boxes.append((x0, y0, x1, y1))
 
         if not boxes:
             return img
 
-        arr = np.array(rgb)
+        # Guard against death by a thousand cuts: several individually
+        # under-60%-of-the-page boxes can still jointly cover nearly the
+        # whole thing when they overlap or tile across it — confirmed on
+        # the same manuscript page, where two ~45%-area "figure" boxes
+        # together spanned the entire vertical extent, still wiping out
+        # the one real text column even after the per-box filter above.
+        mask = np.zeros(rgb.size[::-1], dtype=bool)
         for x0, y0, x1, y1 in boxes:
-            arr[max(0, y0):y1, max(0, x0):x1] = 255
+            mask[max(0, y0):y1, max(0, x0):x1] = True
+        if mask.sum() > page_area * 0.6:
+            return img
+
+        arr = np.array(rgb)
+        arr[mask] = 255
         return Image.fromarray(arr)
     except Exception:
         return img

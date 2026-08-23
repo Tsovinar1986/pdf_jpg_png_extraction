@@ -17,3 +17,8 @@
 #   pip install -r requirements.txt -r requirements-doclayout.txt
 #
 doclayout-yolo
+# doclayout-yolo 0.0.4 imports huggingface_hub directly but doesn't
+# declare it as a dependency (confirmed: `pip show doclayout-yolo` lists
+# nothing pulling it in) — without this line, `from doclayout_yolo import
+# YOLOv10` fails with ModuleNotFoundError on an otherwise-correct install.
+huggingface_hub
