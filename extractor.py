@@ -1304,7 +1304,61 @@ def _append_sidebar_text(text: str, sidebar_results: List[tuple]) -> str:
     return "\n\n".join([text] + [t for _, t in sidebar_results])
 
 
+# Maps a detected dominant script to the OCR_LANGS component that reads
+# it — only used when that component is actually part of the requested
+# language set (see _detect_dominant_single_lang).
+_SCRIPT_TO_LANG = {"armenian": "hye", "cyrillic": "rus", "latin": "eng"}
+
+
+def _detect_dominant_single_lang(raw_img: "Image.Image", lang: str) -> Optional[str]:
+    """If a page is overwhelmingly written in just one of the requested
+    languages, return that language alone instead of the full combined
+    string — running the combined multi-script model on a single-script
+    page is what caused real, confirmed misreads: a short English phrase
+    on a stylized cover came back as Cyrillic look-alike garbage under
+    the combined "hye+rus+eng" model, but read correctly under plain
+    "eng" alone (a short word elsewhere was similarly misread into
+    Armenian look-alikes). Returns None for anything not clearly
+    dominated by one script, so the combined model stays in play exactly
+    where it's needed — a genuinely mixed-language page (e.g. a
+    bilingual table) needs every requested language available at once.
+    """
+    components = lang.split("+")
+    if len(components) < 2:
+        return None  # only one language configured anyway
+
+    try:
+        primary = _preprocess_for_ocr(raw_img)
+        sx, sy = primary.width / raw_img.width, primary.height / raw_img.height
+        probe = _dedup_detections(_detections_from_candidate(primary, sx, sy, lang, "--oem 1", min_conf=40))
+    except Exception:
+        return None
+
+    script_chars: Counter = Counter()
+    total_chars = 0
+    for _box, _conf, word, _support in probe:
+        script = _dominant_script(word)
+        if script:
+            script_chars[script] += len(word)
+        total_chars += len(word)
+    if total_chars < 20:  # not enough signal on a near-empty probe to trust a switch
+        return None
+
+    top_script, top_count = script_chars.most_common(1)[0] if script_chars else (None, 0)
+    if top_script is None or top_count / total_chars < 0.85:
+        return None
+
+    single_lang = _SCRIPT_TO_LANG.get(top_script)
+    if single_lang is None or single_lang not in components:
+        return None
+    return single_lang
+
+
 def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
+    single_lang = _detect_dominant_single_lang(raw_img, lang)
+    if single_lang and single_lang != lang:
+        return _ocr_best_of(raw_img, single_lang)
+
     raw_img = _mask_layout_noise(raw_img)
     # Cheap single-pass probe (one rendering, one config) to tell a normal
     # dense document apart from scattered poster/graphic-style text,
