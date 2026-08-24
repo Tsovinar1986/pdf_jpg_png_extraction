@@ -32,12 +32,9 @@
       <button id="clearFile" class="clear-btn" type="button" aria-label="Remove file">✕</button>
     </div>
 
-    <div class="controls">
+    <div class="controls controls-centered">
       <button id="submitBtn" class="submit-btn" type="button" disabled>
         <span id="submitLabel">Extract text</span>
-      </button>
-      <button id="imagesBtn" class="submit-btn" type="button" disabled>
-        <span id="imagesLabel">Extract images</span>
       </button>
     </div>
 
@@ -71,12 +68,6 @@
       <textarea id="resultText" class="result-text" readonly></textarea>
     </section>
 
-    <section id="imagesBox" class="result-box hidden">
-      <div class="result-header">
-        <span class="result-label">Extracted images <span id="imageCount" class="lang-pill"></span></span>
-      </div>
-      <div id="imageGallery" class="image-gallery"></div>
-    </section>
   </main>
 
   <form id="downloadForm" action="/api/download-text" method="POST" target="downloadFrame" hidden>
