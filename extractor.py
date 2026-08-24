@@ -77,6 +77,18 @@ except Exception:
     YOLOv10 = None
 
 try:
+    # Optional: CRAFT text-region detector (vendored under craft_detector/,
+    # MIT License — see craft_detector/LICENSE), used only as a targeted
+    # gap-filler (see _craft_fill_gaps below) for content the normal OCR
+    # pipeline's own detections miss entirely. Not in requirements.txt —
+    # see requirements-craft.txt and the README.
+    from craft_detector.detect import detect_boxes as _craft_detect_boxes
+    from craft_detector.detect import load_model as _craft_load_model
+except Exception:
+    _craft_detect_boxes = None
+    _craft_load_model = None
+
+try:
     import openpyxl
 except Exception:
     openpyxl = None
@@ -649,6 +661,93 @@ def _split_merged_word_detection(raw_img: "Image.Image", det: tuple, lang: str) 
         ((x, y, best_mid, h), conf, left_text, support),
         ((x + best_mid, y, w - best_mid, h), conf, right_text, support),
     ]
+
+
+_craft_model = None
+_craft_model_tried = False
+
+
+def _get_craft_model():
+    """Lazily load and cache the optional CRAFT text-detection model.
+
+    Same two-state caching as _get_doclayout_model, for the same reason:
+    None is also the legitimate "unavailable" outcome, so a separate
+    "tried" flag stops every image from retrying a slow/failed load.
+    """
+    global _craft_model, _craft_model_tried
+    if _craft_model_tried:
+        return _craft_model
+    _craft_model_tried = True
+
+    if _craft_load_model is None:
+        return None
+    try:
+        weights_path = os.getenv("CRAFT_MODEL_PATH")
+        if not weights_path:
+            from huggingface_hub import hf_hub_download
+            weights_path = hf_hub_download(
+                repo_id="boomb0om/CRAFT-text-detector", filename="craft_mlt_25k.pth"
+            )
+        _craft_model = _craft_load_model(weights_path)
+    except Exception:
+        _craft_model = None
+    return _craft_model
+
+
+def _craft_line_detections(raw_img: "Image.Image", lang: str) -> List[tuple]:
+    """Best-effort: detect text regions with CRAFT — a general-purpose
+    text detector, independent of Tesseract's own layout analysis — and
+    recognize each region with Tesseract, returning plain (box, conf,
+    word) tuples in the same raw shape _detections_from_candidate already
+    produces, so the caller can merge them straight into the same pool
+    _dedup_detections runs over. That's deliberate: it means a CRAFT
+    detection is only trusted as much as the existing, already-calibrated
+    confidence/cross-detection-support logic already trusts anything else
+    — a CRAFT-only read with nothing corroborating it gets exactly the
+    same low support and the same strict trust bar as any other
+    uncorroborated detection, rather than a new bespoke comparison. (Two
+    earlier attempts at "let a second, independent OCR pass carry more
+    weight" both caused real regressions on busy/illustrated pages by
+    outvoting correct, conservative results — reusing the existing
+    calibration instead of inventing a new one avoids repeating that.)
+
+    Confirmed valuable on a real poster: Tesseract's own segmentation
+    fragmented/dropped several comma-dense lines that CRAFT detects as one
+    clean region each, read correctly once cropped tightly around just
+    that region and recognized with --psm 7 (single line).
+
+    Returns [] on any failure, missing dependency, or no boxes found.
+    """
+    net = _get_craft_model()
+    if net is None or pytesseract is None:
+        return []
+
+    try:
+        rgb = raw_img.convert("RGB")
+        boxes = _craft_detect_boxes(net, rgb)
+    except Exception:
+        return []
+
+    detections = []
+    for x0, y0, x1, y1 in boxes:
+        pad = 4
+        crop = rgb.crop((max(0, x0 - pad), max(0, y0 - pad), x1 + pad, y1 + pad))
+        try:
+            text = pytesseract.image_to_string(crop, lang=lang, config="--oem 1 --psm 7").strip()
+            data = pytesseract.image_to_data(crop, lang=lang, config="--oem 1 --psm 7", output_type=pytesseract.Output.DICT)
+        except Exception:
+            continue
+        words = [w for w in data["text"] if w.strip()]
+        if not text or not words or not all(_looks_like_text(w) for w in words) or _REPEATED_CHAR_RE.search(text):
+            continue
+        confs = [float(c) for c, w in zip(data["conf"], data["text"]) if w.strip() and float(c) >= 0]
+        avg_conf = sum(confs) / len(confs) if confs else 0.0
+        # No cross-rendering support count backs these up (see below), so
+        # recognition confidence alone has to clear a real bar here.
+        if avg_conf < 40:
+            continue
+        detections.append(((x0, y0, x1 - x0, y1 - y0), avg_conf, text))
+    return detections
 
 
 def _collect_ocr_detections(raw_img: "Image.Image", lang: str, min_conf: float) -> List[tuple]:
@@ -1304,6 +1403,56 @@ def _append_sidebar_text(text: str, sidebar_results: List[tuple]) -> str:
     return "\n\n".join([text] + [t for _, t in sidebar_results])
 
 
+def _merge_craft_recovery(raw_img: "Image.Image", detections: List[tuple], lang: str) -> List[tuple]:
+    """Merge in CRAFT-detected text regions (see _craft_line_detections),
+    replacing any existing detection they cover rather than sitting
+    alongside it — a small, wrong Tesseract fragment can otherwise end up
+    right next to the correct, complete CRAFT reading of the very same
+    spot in the final joined text.
+
+    Applied after the dominant-block trust-bar filter runs, the same
+    point sidebar recovery merges in — deliberately: CRAFT detections
+    already passed their own two-stage check (CRAFT's own detection
+    confidence, then a Tesseract-recognition-confidence floor in
+    _craft_line_detections) and structurally can't accumulate the
+    cross-rendering support count that trust bar requires, since CRAFT
+    only ever produces one detection per region rather than several
+    renderings' worth to agree with each other. Confirmed necessary: with
+    CRAFT detections merged in *before* that filter instead, every one of
+    them was rejected outright on support alone, even though for the
+    poster this was built for, every single one was the fully correct
+    reading and every rejected fragment was wrong.
+
+    A CRAFT box is only accepted if it overlaps something Tesseract's own
+    pipeline *also* detected at that position — confirmed necessary on an
+    ornately illuminated manuscript page, where CRAFT correctly finds
+    "text-shaped" regions inside the decorative border (flowers, birds,
+    geometric knotwork all have character-like edges) that Tesseract's
+    own detections never touched at all — CRAFT's own confidence on these
+    is not a usable signal here (some scored higher than the poster's
+    genuine content), so requiring Tesseract to have found *something*
+    (however wrong) at the same spot first is the discriminator that
+    actually works: it's what every accepted poster line had in common
+    and every rejected manuscript false-positive lacked. The real cost is
+    a CRAFT box Tesseract missed completely can't be recovered even where
+    it would have been correct — an acceptable trade for not amplifying
+    noise on the images most likely to have it.
+    """
+    craft_detections = _craft_line_detections(raw_img, lang)
+    if not craft_detections:
+        return detections
+    corroborated = [
+        (box, conf, word) for box, conf, word in craft_detections
+        if any(_box_mostly_within(d[0], box) or _box_mostly_within(box, d[0]) for d in detections)
+    ]
+    if not corroborated:
+        return detections
+    craft_boxes = [d[0] for d in corroborated]
+    kept = [d for d in detections if not any(_box_mostly_within(d[0], cb) for cb in craft_boxes)]
+    kept.extend((box, conf, word, 0) for box, conf, word in corroborated)
+    return kept
+
+
 # Maps a detected dominant script to the OCR_LANGS component that reads
 # it — only used when that component is actually part of the requested
 # language set (see _detect_dominant_single_lang).
@@ -1410,6 +1559,13 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     sidebar_results = _recover_rotated_sidebar_text(raw_img, [d[0] for d in detections], lang)
     detections = _exclude_sidebar_noise(detections, sidebar_results)
     detections = _prefer_dominant_paragraph_block(detections)
+    # CRAFT (an independent, non-Tesseract text detector) only for the
+    # scattered/poster-style branch, not dense documents: this is where it
+    # was validated (Tesseract's own segmentation fragmenting/dropping
+    # comma-dense lines on a real poster) and it costs a real detection +
+    # per-region OCR pass, not worth paying on every ordinary page without
+    # the same proof it helps there too.
+    detections = _merge_craft_recovery(raw_img, detections, lang)
     text = _strip_stray_script_glyphs(_detections_to_text(detections))
     return _append_sidebar_text(text, sidebar_results)
 

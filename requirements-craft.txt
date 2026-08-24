@@ -1,0 +1,11 @@
+# Optional: CRAFT text-region detector (vendored under craft_detector/,
+# MIT License) as a targeted gap-filler for OCR — see the README section
+# "Optional: CRAFT detection gap-filler". NOT part of requirements.txt.
+#
+#   pip install -r requirements.txt -r requirements-craft.txt
+#
+# Shares torch/torchvision with requirements-doclayout.txt if you already
+# installed that — pip won't reinstall a satisfied requirement.
+torch
+torchvision
+huggingface_hub

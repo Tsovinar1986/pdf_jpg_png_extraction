@@ -90,6 +90,20 @@ export DOCLAYOUT_MODEL_PATH=/path/to/doclayout_yolo_docstructbench_imgsz1024.pt
 
 Trained on scientific-paper-style document layouts, so expect it to help most on dense text pages (books, reports, forms) with embedded figures/tables, and to have little or no effect on posters, memes, or chat screenshots — those aren't the kind of layout it was trained on. Not baked into the Docker image by default; if you want it there, add `requirements-doclayout.txt` to a custom build.
 
+### Optional: CRAFT detection gap-filler
+
+Short, scattered, decoratively-styled text (a poster, a graphic with dense punctuation-heavy notation) can defeat Tesseract's own layout analysis: it fragments or drops whole lines that a human reads easily. [CRAFT](https://github.com/clovaai/CRAFT-pytorch) (MIT-licensed, vendored under `craft_detector/`) is a general-purpose text-region detector, independent of Tesseract's own segmentation, used here as a targeted gap-filler — not a replacement for the normal pipeline. It only ever *adds* content the pipeline was missing entirely; a CRAFT-detected region is only accepted when Tesseract's own detections also found something (however wrong) at that same spot, which is what reliably tells a real missed line apart from CRAFT mistaking decorative illustration detail for text.
+
+Off by default — extraction works exactly the same without it. Install the optional dependency:
+
+```sh
+pip install -r requirements.txt -r requirements-craft.txt
+```
+
+Shares `torch`/`torchvision` with `requirements-doclayout.txt` if both are installed — pip won't reinstall a satisfied requirement. The ~83MB checkpoint auto-downloads from Hugging Face on first use (cached in `~/.cache/huggingface`); for a manually-downloaded checkpoint instead, set `CRAFT_MODEL_PATH=/path/to/craft_mlt_25k.pth`.
+
+Only applies to short/scattered (poster-style) images, not normal paragraph text — that's where it was validated, and it costs a real extra detection pass plus per-region OCR that isn't worth paying on every ordinary page.
+
 ### Automatic: deskew
 
 Scans and phone photos of book pages are often rotated a few degrees off horizontal, which measurably hurts OCR accuracy. The pipeline detects this automatically (from the aggregate shape of the page's ink pixels) and straightens it before OCR — no flag needed, and it's a no-op (returns the image unchanged) on already-straight pages or when OpenCV isn't installed. This corrects rotational skew only, not the 2D curl a page picks up near a book's spine — that needs a full page-dewarping model and isn't implemented here.
