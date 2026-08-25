@@ -138,9 +138,16 @@ A FastAPI backend serves the extraction API and the frontend:
 uvicorn app.main:app --reload
 ```
 
-Then open http://127.0.0.1:8000 in your browser. Upload a PDF or image and:
-- **Extract text** — runs OCR/text extraction and shows the result (with an image preview when the upload is an image).
-- **Extract images** — pulls out embedded images from a PDF (or the image itself), downloadable individually from the gallery.
+Then open http://127.0.0.1:8000 in your browser. Upload a PDF or image and click **Extract text** to run OCR/text extraction and see the result (with an image preview when the upload is an image).
+
+The frontend is styled with [Tailwind CSS](https://tailwindcss.com), compiled ahead of time into `frontend/style.css` (no build step at request time — FastAPI just serves the static file). If you change Tailwind classes in `frontend/index.html`, rebuild the CSS:
+
+```sh
+cd frontend
+npm install   # first time only
+npm run build:css     # one-off build
+npm run watch:css     # rebuild on every save while you edit
+```
 
 ### Run with Docker
 
