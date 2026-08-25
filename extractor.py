@@ -1099,9 +1099,68 @@ def _text_from_word_data(data: dict) -> str:
         if prev_block_par is not None and key[:2] != prev_block_par:
             out_lines.append("")
         words.sort(key=lambda w: w[0])
+        words = _drop_line_edge_outliers(words)
         out_lines.append(" ".join(w for _left, w, _conf in words))
         prev_block_par = key[:2]
     return "\n".join(out_lines)
+
+
+_EDGE_OUTLIER_MAX_CONF = 60.0
+_EDGE_OUTLIER_MIN_GAP = 25.0
+_EDGE_OUTLIER_MIN_NEIGHBORS = 2
+
+
+def _drop_line_edge_outliers(words: list) -> list:
+    """Drop a low-confidence word sitting at the very start or end of an
+    otherwise strong line — a corner decoration/flourish misread as a
+    short stray character or two, distinct from a genuine low-confidence
+    word (which can't reliably be told apart from real content by
+    confidence alone in general — see _trailing_hallucination_cutoff's
+    docstring for a case where a similar-looking low-confidence fragment
+    turned out to be genuine).
+
+    Confirmed on a real card: three stray edge tokens (confidence 17, 33,
+    56) each sat right next to a corner's decorative flourish, on a line
+    otherwise made of 90+-confidence real words — a much stronger,
+    line-relative signal than an isolated low-confidence word with
+    nothing else on its own line to compare against. That protects the
+    earlier genuine case: it had no other words on its line at all, so
+    the neighbor-count gate below excludes it rather than risk it.
+
+    Confidence + position alone still isn't enough, though: on that same
+    card, a genuinely garbled but real word (5 real letters, mid-word
+    misread, confidence 42) sat at a line's trailing edge too and would
+    have tripped the same rule. Requiring the candidate to also be very
+    short narrows this to just the flourish debris — but even <= 2
+    letters isn't safe: a real scanned page had genuine two-letter
+    Armenian words ("ու", "են" — both common on their own) glued with a
+    stray leading quote mark, correctly low-confidence for the quote's
+    sake but real words underneath, sitting at a line's edge with strong
+    neighbors. Every *confirmed* flourish case was exactly one real
+    letter (there's not enough coherent shape in a decorative swirl for
+    Tesseract to produce more), so the bar is 1, not 2 — narrow enough to
+    leave real two-letter words alone.
+    """
+    if len(words) < _EDGE_OUTLIER_MIN_NEIGHBORS + 1:
+        return words
+    core = words[1:-1] if len(words) > 2 else words
+    core_confs = sorted(w[2] for w in core)
+    median_conf = core_confs[len(core_confs) // 2]
+
+    def is_outlier(word: tuple) -> bool:
+        letters = sum(1 for ch in word[1] if ch.isalpha())
+        return (
+            letters <= 1
+            and word[2] < _EDGE_OUTLIER_MAX_CONF
+            and median_conf - word[2] >= _EDGE_OUTLIER_MIN_GAP
+        )
+
+    trimmed = words
+    if len(trimmed) >= _EDGE_OUTLIER_MIN_NEIGHBORS + 1 and is_outlier(trimmed[0]):
+        trimmed = trimmed[1:]
+    if len(trimmed) >= _EDGE_OUTLIER_MIN_NEIGHBORS + 1 and is_outlier(trimmed[-1]):
+        trimmed = trimmed[:-1]
+    return trimmed
 
 
 _TRAILING_COLLAPSE_LOW_CONF = 55.0
