@@ -288,6 +288,34 @@ def _strip_ocr_noise_marks(text: str) -> str:
     return "\n".join(out_lines)
 
 
+def _strip_standalone_punctuation_tokens(text: str) -> str:
+    """Drop whole word-tokens that consist entirely of punctuation/symbol
+    characters (zero real letters) — a stray apostrophe, Armenian comma
+    ("՝"), or quote mark sitting by itself with real words on either side.
+
+    Punctuation *attached* to a real word (a trailing period, a leading
+    quote before a real word) is left alone — those can be genuine, and a
+    confidence-based attempt to drop them turned out to be unsafe:
+    checked on a real scanned page, a short low-confidence leading
+    fragment was sometimes a real (if incomplete) word, not noise, so
+    confidence + length couldn't tell the two apart. But a token with no
+    letters in it at all can never be a real word in any language this
+    app targets, regardless of confidence — the same reasoning
+    _strip_ocr_noise_marks already applies to grave accents and vertical
+    bars, generalized to whatever other stray marks land as their own
+    isolated token (confirmed on that same page: every standalone
+    zero-letter token was noise — backtick, apostrophe, and "՝" alike).
+    """
+    out_lines = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out_lines.append(line)
+            continue
+        words = [w for w in line.split(" ") if any(ch.isalpha() for ch in w)]
+        out_lines.append(" ".join(words))
+    return "\n".join(out_lines)
+
+
 _STANDALONE_YEV_RE = re.compile(r"^ն([:,.\-»)]*)$")
 
 
@@ -1729,7 +1757,10 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
             if (trusted_is_sparse and boxed_words > trusted_words * 1.15 and boxed_chars >= trusted_chars * 0.9)
             else trusted_text
         )
-        text = _fix_standalone_yev_misread(_strip_ocr_noise_marks(_strip_stray_script_glyphs(text)))
+        text = _strip_stray_script_glyphs(text)
+        text = _strip_ocr_noise_marks(text)
+        text = _strip_standalone_punctuation_tokens(text)
+        text = _fix_standalone_yev_misread(text)
         return _append_sidebar_text(text, sidebar_results)
 
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
@@ -1744,7 +1775,10 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     # per-region OCR pass, not worth paying on every ordinary page without
     # the same proof it helps there too.
     detections = _merge_craft_recovery(raw_img, detections, lang, raw_pool)
-    text = _fix_standalone_yev_misread(_strip_ocr_noise_marks(_strip_stray_script_glyphs(_detections_to_text(detections))))
+    text = _strip_stray_script_glyphs(_detections_to_text(detections))
+    text = _strip_ocr_noise_marks(text)
+    text = _strip_standalone_punctuation_tokens(text)
+    text = _fix_standalone_yev_misread(text)
     return _append_sidebar_text(text, sidebar_results)
 
 
