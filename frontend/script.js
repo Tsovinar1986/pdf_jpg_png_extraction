@@ -20,6 +20,10 @@ const downloadBtn = document.getElementById("downloadBtn");
 const downloadForm = document.getElementById("downloadForm");
 const downloadTextInput = document.getElementById("downloadTextInput");
 const downloadFilenameInput = document.getElementById("downloadFilenameInput");
+const downloadDocxBtn = document.getElementById("downloadDocxBtn");
+const downloadDocxForm = document.getElementById("downloadDocxForm");
+const downloadDocxTextInput = document.getElementById("downloadDocxTextInput");
+const downloadDocxFilenameInput = document.getElementById("downloadDocxFilenameInput");
 
 const IMAGE_EXTS = new Set([
   ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp", ".heic", ".heif",
@@ -213,4 +217,11 @@ downloadBtn.addEventListener("click", () => {
   downloadTextInput.value = resultText.value;
   downloadFilenameInput.value = lastResultFilename || "extracted-text.txt";
   downloadForm.submit();
+});
+
+downloadDocxBtn.addEventListener("click", () => {
+  if (!resultText.value) return;
+  downloadDocxTextInput.value = resultText.value;
+  downloadDocxFilenameInput.value = lastResultFilename || "extracted-text.docx";
+  downloadDocxForm.submit();
 });

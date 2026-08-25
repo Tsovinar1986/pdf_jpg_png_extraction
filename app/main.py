@@ -11,8 +11,9 @@ from typing import Iterator, List, Optional
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
+from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
@@ -129,18 +130,33 @@ async def extract_images(file: UploadFile = File(...)):
     return ImageExtractionResponse(images=payload, filename=file.filename or "")
 
 
-def _safe_download_filename(name: str) -> str:
+def _safe_download_filename(name: str, ext: str) -> str:
     stem = Path(name or "extracted-text").stem or "extracted-text"
     stem = re.sub(r'[\r\n"/\\]+', "_", stem)
-    return f"{stem}.txt"
+    return f"{stem}.{ext}"
 
 
 @app.post("/api/download-text")
 async def download_text(text: str = Form(...), filename: str = Form("extracted-text.txt")):
-    safe_name = _safe_download_filename(filename)
+    safe_name = _safe_download_filename(filename, "txt")
     return PlainTextResponse(
         text,
         media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
+@app.post("/api/download-docx")
+async def download_docx(text: str = Form(...), filename: str = Form("extracted-text.docx")):
+    safe_name = _safe_download_filename(filename, "docx")
+    document = Document()
+    for line in (text or "").split("\n"):
+        document.add_paragraph(line)
+    buf = io.BytesIO()
+    document.save(buf)
+    return Response(
+        buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
     )
 

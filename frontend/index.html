@@ -8,8 +8,37 @@
 </head>
 <body class="min-h-screen relative flex items-center justify-center overflow-x-hidden p-4 py-8 font-sans text-slate-800 bg-slate-100 dark:text-slate-100 dark:bg-[#0f1220]">
 
-  <div class="pointer-events-none fixed -top-28 -left-24 z-0 h-[420px] w-[420px] rounded-full bg-accent opacity-20 blur-[110px] dark:opacity-35"></div>
-  <div class="pointer-events-none fixed -bottom-32 -right-24 z-0 h-[420px] w-[420px] rounded-full bg-accent2 opacity-20 blur-[110px] dark:opacity-35"></div>
+  <div class="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
+    <div class="animate-blob-drift absolute -top-28 -left-24 h-[420px] w-[420px] rounded-full bg-accent opacity-20 blur-[110px] dark:opacity-35"></div>
+    <div class="animate-blob-drift absolute -bottom-32 -right-24 h-[420px] w-[420px] rounded-full bg-accent2 opacity-20 blur-[110px] dark:opacity-35" style="animation-delay:-8s"></div>
+
+    <!-- faint scanned-page silhouette with a sweeping scan line, evoking a document being read -->
+    <div class="absolute left-1/2 top-1/2 h-[580px] w-[400px] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-black/10 opacity-[0.07] dark:border-white/20 dark:opacity-[0.14]">
+      <div class="absolute inset-x-6 top-8 h-2 rounded bg-current"></div>
+      <div class="absolute inset-x-6 top-14 h-2 w-2/3 rounded bg-current"></div>
+      <div class="absolute inset-x-6 top-24 h-2 rounded bg-current"></div>
+      <div class="absolute inset-x-6 top-32 h-2 w-4/5 rounded bg-current"></div>
+      <div class="absolute inset-x-6 top-44 h-2 rounded bg-current"></div>
+      <div class="absolute inset-x-6 top-52 h-2 w-3/5 rounded bg-current"></div>
+      <div class="absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r from-transparent via-accent2 to-transparent opacity-80 animate-scan"></div>
+    </div>
+
+    <!-- characters drifting upward, standing in for text being lifted out of a scanned page (Armenian/Cyrillic/Latin — this app's OCR languages) -->
+    <span class="animate-glyph-float absolute bottom-0 text-2xl font-semibold text-accent/30 dark:text-accent/40" style="left:4%;animation-duration:15s;animation-delay:-3s">Ա</span>
+    <span class="animate-glyph-float absolute bottom-0 text-xl font-semibold text-accent2/30 dark:text-accent2/40" style="left:12%;animation-duration:19s;animation-delay:-9s">Ж</span>
+    <span class="animate-glyph-float absolute bottom-0 text-lg font-semibold text-accent/25 dark:text-accent/35" style="left:20%;animation-duration:13s;animation-delay:-1s">Q</span>
+    <span class="animate-glyph-float absolute bottom-0 text-3xl font-semibold text-accent2/25 dark:text-accent2/35" style="left:28%;animation-duration:21s;animation-delay:-14s">Ք</span>
+    <span class="animate-glyph-float absolute bottom-0 text-xl font-semibold text-accent/30 dark:text-accent/40" style="left:36%;animation-duration:16s;animation-delay:-6s">R</span>
+    <span class="animate-glyph-float absolute bottom-0 text-2xl font-semibold text-accent2/30 dark:text-accent2/40" style="left:44%;animation-duration:12s;animation-delay:-4s">Я</span>
+    <span class="animate-glyph-float absolute bottom-0 text-lg font-semibold text-accent/25 dark:text-accent/35" style="left:52%;animation-duration:18s;animation-delay:-11s">Ֆ</span>
+    <span class="animate-glyph-float absolute bottom-0 text-2xl font-semibold text-accent2/30 dark:text-accent2/40" style="left:60%;animation-duration:14s;animation-delay:-7s">A</span>
+    <span class="animate-glyph-float absolute bottom-0 text-xl font-semibold text-accent/25 dark:text-accent/35" style="left:68%;animation-duration:20s;animation-delay:-2s">Щ</span>
+    <span class="animate-glyph-float absolute bottom-0 text-3xl font-semibold text-accent2/25 dark:text-accent2/35" style="left:76%;animation-duration:17s;animation-delay:-13s">Բ</span>
+    <span class="animate-glyph-float absolute bottom-0 text-lg font-semibold text-accent/30 dark:text-accent/40" style="left:84%;animation-duration:15s;animation-delay:-5s">G</span>
+    <span class="animate-glyph-float absolute bottom-0 text-2xl font-semibold text-accent2/30 dark:text-accent2/40" style="left:92%;animation-duration:19s;animation-delay:-10s">Ф</span>
+    <span class="animate-glyph-float absolute bottom-0 text-xl font-semibold text-accent/25 dark:text-accent/35" style="left:8%;animation-duration:22s;animation-delay:-17s">T</span>
+    <span class="animate-glyph-float absolute bottom-0 text-lg font-semibold text-accent2/25 dark:text-accent2/35" style="left:56%;animation-duration:13s;animation-delay:-8s">Գ</span>
+  </div>
 
   <main class="relative z-10 w-full max-w-xl rounded-3xl border border-black/10 bg-white/80 p-8 shadow-2xl shadow-slate-900/10 backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.06] dark:shadow-black/40">
 
@@ -60,7 +89,9 @@
         <span class="text-[13px] text-slate-500 dark:text-slate-400">Extracted text</span>
         <div class="flex gap-2">
           <button id="downloadBtn" type="button"
-            class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10">Download</button>
+            class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10">Download .txt</button>
+          <button id="downloadDocxBtn" type="button"
+            class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10">Download .docx</button>
           <button id="copyBtn" type="button"
             class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10">Copy</button>
         </div>
@@ -81,6 +112,10 @@
   <form id="downloadForm" action="/api/download-text" method="POST" target="downloadFrame" hidden>
     <input type="hidden" name="text" id="downloadTextInput">
     <input type="hidden" name="filename" id="downloadFilenameInput">
+  </form>
+  <form id="downloadDocxForm" action="/api/download-docx" method="POST" target="downloadFrame" hidden>
+    <input type="hidden" name="text" id="downloadDocxTextInput">
+    <input type="hidden" name="filename" id="downloadDocxFilenameInput">
   </form>
   <iframe name="downloadFrame" hidden></iframe>
 
