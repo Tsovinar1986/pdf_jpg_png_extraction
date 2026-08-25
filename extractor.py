@@ -1086,17 +1086,60 @@ def _text_from_word_data(data: dict) -> str:
         if not word:
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        groups.setdefault(key, []).append((data["left"][i], word))
+        conf = float(data["conf"][i])
+        groups.setdefault(key, []).append((data["left"][i], word, conf))
+
+    cutoff = _trailing_hallucination_cutoff(list(groups.values()))
 
     out_lines: List[str] = []
     prev_block_par = None
-    for key, words in groups.items():
+    for idx, (key, words) in enumerate(groups.items()):
+        if idx >= cutoff:
+            break
         if prev_block_par is not None and key[:2] != prev_block_par:
             out_lines.append("")
         words.sort(key=lambda w: w[0])
-        out_lines.append(" ".join(w for _left, w in words))
+        out_lines.append(" ".join(w for _left, w, _conf in words))
         prev_block_par = key[:2]
     return "\n".join(out_lines)
+
+
+_TRAILING_COLLAPSE_LOW_CONF = 55.0
+_TRAILING_COLLAPSE_MIN_LINES = 3
+
+
+def _trailing_hallucination_cutoff(line_groups: List[list]) -> int:
+    """Index to stop at when the page's last several lines all read at
+    sustained low confidence with no recovery — a different signature
+    than an ordinary hard-to-read word or two, which sits among otherwise
+    high-confidence neighbors and gets outweighed by them in that line's
+    own mean.
+
+    Confirmed on a real greeting card: real body text (80s-90s mean
+    confidence per line, occasional single-word dips into the 40s that
+    don't drag the line average down) ends cleanly, and every line after
+    it — reading a decorative graphic and a diagonal watermark as if they
+    were more Armenian text — sits in the single digits to 40s with zero
+    lines recovering above the low-confidence bar for the rest of the
+    page. That "collapses and never comes back" shape is what's checked
+    here, not a one-off low score, so a real document with one genuinely
+    hard final line isn't truncated for it.
+    """
+    line_confs = []
+    for words in line_groups:
+        confs = [c for _left, _word, c in words if c >= 0]
+        line_confs.append(sum(confs) / len(confs) if confs else 0.0)
+
+    n = len(line_confs)
+    collapse_start = n
+    for i in range(n - 1, -1, -1):
+        if line_confs[i] < _TRAILING_COLLAPSE_LOW_CONF:
+            collapse_start = i
+        else:
+            break
+    if n - collapse_start >= _TRAILING_COLLAPSE_MIN_LINES:
+        return collapse_start
+    return n
 
 
 def _mean_word_confidence(data: dict) -> float:
