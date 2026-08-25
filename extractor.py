@@ -976,24 +976,33 @@ def _text_from_word_data(data: dict) -> str:
     Tesseract's own block/paragraph/line structure — a faithful stand-in
     for image_to_string's serialization, not a different reading-order
     reconstruction, so the "trust Tesseract's own reading order" property
-    _best_full_page_text relies on still holds."""
-    out_lines: List[str] = []
-    current_line: List[str] = []
-    prev_key = None
+    _best_full_page_text relies on still holds.
+
+    Words within a (block, par, line) group are joined sorted by their own
+    x-position, not by Tesseract's raw word_num sequence — confirmed
+    necessary on a real decorative, centered poster-style page, where
+    word_num 1 within a claimed line sat *below* word_num 2-5 in the same
+    line (different y entirely): Tesseract's own within-line ordering
+    isn't reliably left-to-right on this kind of layout, even though its
+    block/paragraph/line grouping and the order those groups appear in
+    (top-to-bottom reading order) still are.
+    """
+    groups: dict = {}
     for i, word in enumerate(data["text"]):
         word = word.strip()
         if not word:
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        if prev_key is not None and key != prev_key:
-            out_lines.append(" ".join(current_line))
-            if key[:2] != prev_key[:2]:
-                out_lines.append("")
-            current_line = []
-        current_line.append(word)
-        prev_key = key
-    if current_line:
-        out_lines.append(" ".join(current_line))
+        groups.setdefault(key, []).append((data["left"][i], word))
+
+    out_lines: List[str] = []
+    prev_block_par = None
+    for key, words in groups.items():
+        if prev_block_par is not None and key[:2] != prev_block_par:
+            out_lines.append("")
+        words.sort(key=lambda w: w[0])
+        out_lines.append(" ".join(w for _left, w in words))
+        prev_block_par = key[:2]
     return "\n".join(out_lines)
 
 
