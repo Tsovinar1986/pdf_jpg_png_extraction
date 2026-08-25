@@ -860,6 +860,18 @@ def _detections_to_text(detections: List[tuple]) -> str:
 _MIN_TRUSTED_SUPPORT = 8
 _MIN_TRUSTED_CONFIDENCE = 85.0
 
+# Below this many recognized words, the "trusted" full-page reading is
+# sparse enough to call a real failure (Tesseract's single winning
+# candidate lost most of the page), so a boxed-reconstruction fallback
+# with more recovered words is worth trusting instead. At or above it,
+# a word-count margin alone stopped being a safe signal: on a real dense
+# scan, the union of detections across many renderings accumulates
+# genuine per-word fragments (one real word split into 2-3 partial reads
+# by different renderings) that inflate boxed_words exactly like a real
+# recovery would, with no reliable way to tell the two apart from counts
+# or confidence alone (both were tested and failed to discriminate).
+_TRUSTED_SPARSE_WORD_LIMIT = 15
+
 
 def _find_dominant_paragraph_block(detections: List[tuple]) -> Optional[dict]:
     """Find one clearly dominant multi-line paragraph block among the
@@ -1572,7 +1584,12 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
 
         trusted_words, trusted_chars = _word_count(trusted_text), _full_text_score(trusted_text)
         boxed_words, boxed_chars = _word_count(boxed_text), _full_text_score(boxed_text)
-        text = boxed_text if (boxed_words > trusted_words * 1.15 and boxed_chars >= trusted_chars * 0.9) else trusted_text
+        trusted_is_sparse = trusted_words < _TRUSTED_SPARSE_WORD_LIMIT
+        text = (
+            boxed_text
+            if (trusted_is_sparse and boxed_words > trusted_words * 1.15 and boxed_chars >= trusted_chars * 0.9)
+            else trusted_text
+        )
         text = _strip_stray_script_glyphs(text)
         return _append_sidebar_text(text, sidebar_results)
 
