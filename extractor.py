@@ -288,6 +288,36 @@ def _strip_ocr_noise_marks(text: str) -> str:
     return "\n".join(out_lines)
 
 
+_STANDALONE_YEV_RE = re.compile(r"^ն([:,.\-»)]*)$")
+
+
+def _fix_standalone_yev_misread(text: str) -> str:
+    """Turn a standalone word that's just "ն" into "և" (Armenian "and").
+
+    Confirmed as a genuine, consistent Tesseract "hye" model weakness, not
+    a scan-quality artifact: the ligature և misreads as ն even on a clean
+    synthetic render (4/4 test cases), both where և stands alone as its
+    own word and where it's embedded inside a word (հետևում -> հետնում,
+    դեռևս -> դեռես). Only the standalone-word case is safe to correct
+    here: ն is one of the most common letters in real Armenian words, so
+    rewriting every embedded ն would corrupt far more correct text than it
+    would fix. But standalone single-character "ն" isn't a real Armenian
+    word on its own the way standalone "և" commonly is (meaning "and"), so
+    a whole word that's exactly ն (optionally with trailing punctuation
+    that survived tokenization, e.g. "ն:" or "ն.") is near-certainly this
+    same misread rather than genuine content.
+    """
+    out_lines = []
+    for line in text.split("\n"):
+        words = line.split(" ")
+        fixed = []
+        for word in words:
+            match = _STANDALONE_YEV_RE.match(word)
+            fixed.append("և" + match.group(1) if match else word)
+        out_lines.append(" ".join(fixed))
+    return "\n".join(out_lines)
+
+
 def _strip_stray_script_glyphs(text: str) -> str:
     """Drop short (<=2 char) word-tokens whose script doesn't match the
     rest of their line.
@@ -1699,7 +1729,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
             if (trusted_is_sparse and boxed_words > trusted_words * 1.15 and boxed_chars >= trusted_chars * 0.9)
             else trusted_text
         )
-        text = _strip_ocr_noise_marks(_strip_stray_script_glyphs(text))
+        text = _fix_standalone_yev_misread(_strip_ocr_noise_marks(_strip_stray_script_glyphs(text)))
         return _append_sidebar_text(text, sidebar_results)
 
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
@@ -1714,7 +1744,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     # per-region OCR pass, not worth paying on every ordinary page without
     # the same proof it helps there too.
     detections = _merge_craft_recovery(raw_img, detections, lang, raw_pool)
-    text = _strip_ocr_noise_marks(_strip_stray_script_glyphs(_detections_to_text(detections)))
+    text = _fix_standalone_yev_misread(_strip_ocr_noise_marks(_strip_stray_script_glyphs(_detections_to_text(detections))))
     return _append_sidebar_text(text, sidebar_results)
 
 
