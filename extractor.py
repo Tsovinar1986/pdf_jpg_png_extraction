@@ -13,7 +13,6 @@ import argparse
 import io
 import os
 import re
-import statistics
 import subprocess
 import sys
 import zipfile
@@ -1023,6 +1022,14 @@ def _mean_word_confidence(data: dict) -> float:
     return sum(confs) / len(confs) if confs else -1.0
 
 
+# See _best_full_page_text's docstring for how these two work together:
+# the confidence floor throws out pure hallucination before it can set
+# the completeness reference, and the ratio then requires near-parity
+# with the fullest plausible reading, not just "not obviously sparse".
+_MIN_CANDIDATE_CONFIDENCE = 50.0
+_FULL_PAGE_COMPLETENESS_RATIO = 0.85
+
+
 def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
     """Full-page OCR that trusts Tesseract's own built-in reading-order
     reconstruction, trying each candidate rendering/config and keeping
@@ -1039,16 +1046,29 @@ def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
     sparse-but-confident read (e.g. one easy word) can't beat a complete
     page merely by having fewer chances to be wrong.
 
-    That completeness reference is the *median* word count, not the max:
-    a real scanned photo (paper texture/grain, not just clean synthetic
-    text) can make one candidate hallucinate a wall of spurious short
-    "words" out of noise — confirmed on one where a single outlier
-    candidate found 405 "words" against every genuinely good candidate's
-    51-144, all at markedly lower confidence. Using that outlier as the
-    max reference inflated the completeness bar so high it excluded every
-    clean candidate, leaving only noisy ones to pick the "best" of. The
-    median sits with the genuine cluster and isn't dragged up by one
-    hallucinating candidate the way a max is.
+    The completeness reference is the max word count *among candidates
+    that clear a confidence floor first*, not the raw max and not the
+    median. The raw max fails on a real scanned photo (paper
+    texture/grain, not just clean synthetic text): one candidate can
+    hallucinate a wall of spurious short "words" out of noise —
+    confirmed on one where a single outlier candidate found 405 "words"
+    at 28% confidence against every genuinely good candidate's 51-144 at
+    56-92%. Using that outlier as the reference inflated the
+    completeness bar so high it excluded every clean candidate. But the
+    median has the opposite failure: on a real dense scan, Tesseract's
+    automatic page-layout analysis can silently drop whole paragraphs
+    from *most* candidates while still reading the paragraphs it keeps
+    at high confidence (confirmed on one where several candidates
+    independently settled on the same incomplete ~70-word reading at
+    ~90% confidence, meaning the median sat right there too) — so a
+    genuinely complete candidate at merely-good confidence (~75%, still
+    clearing the floor) never got to compete, since it didn't clear
+    "median * 0.7" either. Filtering to a confidence floor first (which
+    the 405-word outlier fails outright) and taking the max *within that
+    filtered pool* gets the reference from the actual fullest plausible
+    reading instead of the typical one, so a candidate that's merely
+    good but missing a third of the page can't beat it on confidence
+    alone.
     """
     results = []
     for candidate, _sx, _sy in _ocr_candidate_images(raw_img):
@@ -1065,8 +1085,10 @@ def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
     if not results:
         return ""
 
-    median_words = statistics.median(r[1] for r in results)
-    complete_enough = [r for r in results if r[1] >= median_words * 0.7]
+    plausible = [r for r in results if r[0] >= _MIN_CANDIDATE_CONFIDENCE]
+    pool = plausible or results
+    max_words = max(r[1] for r in pool)
+    complete_enough = [r for r in pool if r[1] >= max_words * _FULL_PAGE_COMPLETENESS_RATIO]
     best_conf, _best_words, best_data = max(complete_enough, key=lambda r: r[0])
     return _text_from_word_data(best_data)
 
