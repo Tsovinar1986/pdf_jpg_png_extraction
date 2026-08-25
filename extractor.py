@@ -13,6 +13,7 @@ import argparse
 import io
 import os
 import re
+import statistics
 import subprocess
 import sys
 import zipfile
@@ -1013,9 +1014,20 @@ def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
     (confirmed on a real case: a garbled candidate won the old
     character-count comparison outright while sitting ~20 points below
     every other candidate's mean confidence). Candidates that recognize
-    much less text than the fullest candidate are excluded first so a
+    much less text than a typical candidate are excluded first so a
     sparse-but-confident read (e.g. one easy word) can't beat a complete
     page merely by having fewer chances to be wrong.
+
+    That completeness reference is the *median* word count, not the max:
+    a real scanned photo (paper texture/grain, not just clean synthetic
+    text) can make one candidate hallucinate a wall of spurious short
+    "words" out of noise — confirmed on one where a single outlier
+    candidate found 405 "words" against every genuinely good candidate's
+    51-144, all at markedly lower confidence. Using that outlier as the
+    max reference inflated the completeness bar so high it excluded every
+    clean candidate, leaving only noisy ones to pick the "best" of. The
+    median sits with the genuine cluster and isn't dragged up by one
+    hallucinating candidate the way a max is.
     """
     results = []
     for candidate, _sx, _sy in _ocr_candidate_images(raw_img):
@@ -1032,8 +1044,8 @@ def _best_full_page_text(raw_img: "Image.Image", lang: str) -> str:
     if not results:
         return ""
 
-    max_words = max(r[1] for r in results)
-    complete_enough = [r for r in results if r[1] >= max_words * 0.7]
+    median_words = statistics.median(r[1] for r in results)
+    complete_enough = [r for r in results if r[1] >= median_words * 0.7]
     best_conf, _best_words, best_data = max(complete_enough, key=lambda r: r[0])
     return _text_from_word_data(best_data)
 
