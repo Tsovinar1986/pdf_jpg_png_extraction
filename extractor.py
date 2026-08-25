@@ -264,6 +264,30 @@ def _dominant_script(word: str) -> Optional[str]:
     return best if counts[best] > 0 else None
 
 
+_NOISE_MARK_RE = re.compile(r"[`|]")
+
+
+def _strip_ocr_noise_marks(text: str) -> str:
+    """Drop grave-accent and vertical-bar characters wherever they appear
+    (glued onto a real word or standing alone).
+
+    Neither has any real use in the document types this app targets (PDF
+    scans, photos, spreadsheets) outside of code/markdown, so seeing one
+    is near-certain evidence of paper grain/dust being misread as a
+    stray mark rather than real content (confirmed on a real scanned
+    page: every grave accent and vertical bar in its output was noise,
+    scattered around otherwise-correct words). Unlike a period, quote, or
+    apostrophe, there's no legitimate-use case to weigh against removing
+    them unconditionally.
+    """
+    out_lines = []
+    for line in text.split("\n"):
+        cleaned = _NOISE_MARK_RE.sub("", line)
+        cleaned = re.sub(r" {2,}", " ", cleaned).strip()
+        out_lines.append(cleaned)
+    return "\n".join(out_lines)
+
+
 def _strip_stray_script_glyphs(text: str) -> str:
     """Drop short (<=2 char) word-tokens whose script doesn't match the
     rest of their line.
@@ -1612,7 +1636,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
             if (trusted_is_sparse and boxed_words > trusted_words * 1.15 and boxed_chars >= trusted_chars * 0.9)
             else trusted_text
         )
-        text = _strip_stray_script_glyphs(text)
+        text = _strip_ocr_noise_marks(_strip_stray_script_glyphs(text))
         return _append_sidebar_text(text, sidebar_results)
 
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
@@ -1626,7 +1650,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     # per-region OCR pass, not worth paying on every ordinary page without
     # the same proof it helps there too.
     detections = _merge_craft_recovery(raw_img, detections, lang)
-    text = _strip_stray_script_glyphs(_detections_to_text(detections))
+    text = _strip_ocr_noise_marks(_strip_stray_script_glyphs(_detections_to_text(detections)))
     return _append_sidebar_text(text, sidebar_results)
 
 
