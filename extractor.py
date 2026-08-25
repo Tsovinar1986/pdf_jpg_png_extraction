@@ -1308,10 +1308,36 @@ def _deskew(img: "Image.Image") -> "Image.Image":
 
         h, w = gray.shape
         matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-        rotated = cv2.warpAffine(arr, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        return Image.fromarray(rotated)
+        rotated_arr = cv2.warpAffine(arr, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        rotated = Image.fromarray(rotated_arr)
+
+        # The angle estimate (whole-image minAreaRect over all ink pixels)
+        # assumes the page is, in aggregate, a simple rotated rectangle of
+        # text — true for a scanned/photographed page, but not for a
+        # digitally-created poster with decorative corner flourishes:
+        # confirmed on a real one where those threw the estimate off by a
+        # small but real-looking 2.84 degrees (well inside the range a
+        # genuinely rotated scan would also show, so raising the angle
+        # threshold can't safely filter this out without also rejecting
+        # real rotated scans). A quick confidence probe on both versions
+        # catches it directly instead of trying to out-guess the angle
+        # estimator: only commit to the rotation if it actually reads
+        # better than the original.
+        if pytesseract is not None and _rotation_makes_ocr_worse(rgb, rotated):
+            return img
+        return rotated
     except Exception:
         return img
+
+
+def _rotation_makes_ocr_worse(original: "Image.Image", rotated: "Image.Image") -> bool:
+    try:
+        config = "--oem 1 --psm 6"
+        orig_data = pytesseract.image_to_data(original, lang=DEFAULT_OCR_LANGS, config=config, output_type=pytesseract.Output.DICT)
+        rot_data = pytesseract.image_to_data(rotated, lang=DEFAULT_OCR_LANGS, config=config, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return False  # can't tell — don't block the rotation on a probe failure
+    return _mean_word_confidence(rot_data) < _mean_word_confidence(orig_data)
 
 
 def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
