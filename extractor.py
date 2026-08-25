@@ -1482,7 +1482,15 @@ def _append_sidebar_text(text: str, sidebar_results: List[tuple]) -> str:
     return "\n\n".join([text] + [t for _, t in sidebar_results])
 
 
-def _merge_craft_recovery(raw_img: "Image.Image", detections: List[tuple], lang: str) -> List[tuple]:
+# Below this many trust-bar-passing detections, a page's raw (pre-filter)
+# Tesseract output isn't a safe corroboration source — see
+# _merge_craft_recovery's docstring for why.
+_MIN_TRUSTED_FOR_RAW_CORROBORATION = 10
+
+
+def _merge_craft_recovery(
+    raw_img: "Image.Image", detections: List[tuple], lang: str, raw_pool: Optional[List[tuple]] = None
+) -> List[tuple]:
     """Merge in CRAFT-detected text regions (see _craft_line_detections),
     replacing any existing detection they cover rather than sitting
     alongside it — a small, wrong Tesseract fragment can otherwise end up
@@ -1516,13 +1524,68 @@ def _merge_craft_recovery(raw_img: "Image.Image", detections: List[tuple], lang:
     a CRAFT box Tesseract missed completely can't be recovered even where
     it would have been correct — an acceptable trade for not amplifying
     noise on the images most likely to have it.
+
+    That cost turned out to be real on a genuine poster: one whole phrase
+    fell in a spot where Tesseract's raw read was badly garbled (its own
+    per-word confidence in the low 40s-50s, same range as the manuscript's
+    false positives), so the trust-bar-filtered detections never touched
+    it and CRAFT's correct reading of the same spot got rejected for lack
+    of corroboration. Confidence can't tell these two "Tesseract garbled
+    it" cases apart (the manuscript's noise scored as high as 69 in
+    spots) - but the *amount* of trustworthy content elsewhere on the
+    page can: a real poster with one bad patch still has a healthy pile
+    of trust-bar-passing detections everywhere else (14 on this one),
+    while the manuscript's near-total illegibility left it with almost
+    none (5, out of 454 raw reads - the other 98.9% was noise). So when
+    the page has enough confirmed-good content to call it mostly legible,
+    the corroboration check widens to the raw (pre-filter) detections
+    too; otherwise it stays scoped to the filtered set that keeps the
+    manuscript's false positives out.
     """
     craft_detections = _craft_line_detections(raw_img, lang)
     if not craft_detections:
         return detections
+    corroboration_pool = detections
+    if raw_pool is not None and len(detections) >= _MIN_TRUSTED_FOR_RAW_CORROBORATION:
+        # Only *add* raw entries that aren't already standing in for a
+        # position `detections` already covers — otherwise a losing
+        # duplicate from a different rendering (dropped by dedup/the
+        # trust bar in favor of a same-word box that ended up drawn
+        # slightly differently) can corroborate a CRAFT box on its own,
+        # while the box that's actually still in `detections` doesn't
+        # overlap that CRAFT box enough to be removed below — corroborated
+        # without removing what it's meant to replace, producing a
+        # duplicate word (confirmed on a real fixture: a losing "է" box
+        # matched CRAFT's box almost exactly while the kept "է" didn't).
+        #
+        # A plain box-overlap check can't tell that case apart from two
+        # genuinely different words on adjacent lines whose boxes happen
+        # to graze each other at a shared boundary (confirmed on a real
+        # poster: two different real words' boxes shared an 11px sliver,
+        # geometrically about as much overlap as the "է" duplicate had
+        # with its own winner) — same overlap fraction, opposite correct
+        # answer. Matching on the *recognized word text* first sidesteps
+        # that ambiguity: two detections reading the same word near the
+        # same spot are the same-word-different-rendering case this
+        # exists to catch, while two different words never trigger it
+        # regardless of how their boxes happen to touch.
+        def _already_covered(raw_entry: tuple) -> bool:
+            rx, ry, rw, rh = raw_entry[0]
+            rcx, rcy = rx + rw / 2, ry + rh / 2
+            for e in detections:
+                if e[2] != raw_entry[2]:
+                    continue
+                ex, ey, ew, eh = e[0]
+                ecx, ecy = ex + ew / 2, ey + eh / 2
+                if abs(rcy - ecy) < max(rh, eh) and abs(rcx - ecx) < max(rw, ew) * 1.5:
+                    return True
+            return False
+
+        new_evidence = [r for r in raw_pool if not _already_covered(r)]
+        corroboration_pool = detections + new_evidence
     corroborated = [
         (box, conf, word) for box, conf, word in craft_detections
-        if any(_box_mostly_within(d[0], box) or _box_mostly_within(box, d[0]) for d in detections)
+        if any(_box_mostly_within(d[0], box) or _box_mostly_within(box, d[0]) for d in corroboration_pool)
     ]
     if not corroborated:
         return detections
@@ -1642,6 +1705,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
     sidebar_results = _recover_rotated_sidebar_text(raw_img, [d[0] for d in detections], lang)
     detections = _exclude_sidebar_noise(detections, sidebar_results)
+    raw_pool = detections
     detections = _prefer_dominant_paragraph_block(detections)
     # CRAFT (an independent, non-Tesseract text detector) only for the
     # scattered/poster-style branch, not dense documents: this is where it
@@ -1649,7 +1713,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     # comma-dense lines on a real poster) and it costs a real detection +
     # per-region OCR pass, not worth paying on every ordinary page without
     # the same proof it helps there too.
-    detections = _merge_craft_recovery(raw_img, detections, lang)
+    detections = _merge_craft_recovery(raw_img, detections, lang, raw_pool)
     text = _strip_ocr_noise_marks(_strip_stray_script_glyphs(_detections_to_text(detections)))
     return _append_sidebar_text(text, sidebar_results)
 
