@@ -411,7 +411,22 @@ def _boxes_compete(a: tuple, b: tuple) -> bool:
         return False  # not even the same line
     overlap_x = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
     smaller_w = min(aw, bw)
-    return smaller_w > 0 and overlap_x / smaller_w > 0.5
+    if smaller_w <= 0:
+        return False
+    if overlap_x / smaller_w > 0.5:
+        return True
+    # A box roughly as narrow as it is tall is ~one character wide in
+    # every script this app targets, leaving little width for two
+    # candidates' box estimates of the same glyph to agree on — confirmed
+    # on a real case: the same single Armenian letter, read by two
+    # different candidate renderings, produced boxes (18px and 23px wide)
+    # that only overlapped by 4px, under the 50% bar above, so neither
+    # IoU nor that ratio caught them as the same detection. But two
+    # genuinely different words never overlap in x at all on a
+    # left-to-right line, so any positive overlap between two
+    # single-character-scale boxes is still safe to treat as competing,
+    # without needing that ratio.
+    return smaller_w <= max(ah, bh) and overlap_x > 0
 
 
 def _box_mostly_within(inner: tuple, outer: tuple) -> bool:
@@ -974,6 +989,25 @@ def _find_dominant_paragraph_block(detections: List[tuple]) -> Optional[dict]:
     if median_h <= 0:
         return None
 
+    # A fixed multiple of glyph height alone is too tight: real line
+    # pitch depends on the page's own leading/line-height (a web
+    # screenshot's default ~1.5-1.8x font size routinely lands right at
+    # or past a flat 1.8x-word-height cutoff), not on glyph height alone.
+    # Confirmed on a real case: a 3-line paragraph at ordinary line
+    # spacing (line gap / median word height ~= 1.82) never merged into
+    # one block under the old flat cutoff, so it never qualified as
+    # "paragraph-shaped" — which then let the stricter global
+    # confidence+support filter delete its trailing word outright. Using
+    # the page's own median line-to-line gap as an additional reference
+    # (with headroom, not a tighter replacement — the max() only ever
+    # loosens the bound) tracks the actual line pitch in use instead of
+    # assuming one fixed ratio, while a genuinely separate block (a
+    # caption jump, a section break) still lands well past its own body
+    # text's typical gap and stays excluded.
+    line_gaps = sorted(lines[i + 1]["y"] - lines[i]["y"] for i in range(len(lines) - 1))
+    median_gap = line_gaps[len(line_gaps) // 2] if line_gaps else 0.0
+    merge_gap = max(median_h * 1.8, median_gap * 1.35)
+
     # Group lines into blocks by *both* vertical proximity and horizontal
     # overlap. Y-proximity alone isn't enough: a column of single-glyph
     # border noise running down one edge sits at roughly the same
@@ -990,7 +1024,7 @@ def _find_dominant_paragraph_block(detections: List[tuple]) -> Optional[dict]:
         for blk in blocks:
             last = blk["lines"][-1]
             overlaps = x0 <= blk["x1"] and blk["x0"] <= x1
-            if overlaps and (ln["y"] - last["y"]) < median_h * 1.8:
+            if overlaps and (ln["y"] - last["y"]) < merge_gap:
                 blk["lines"].append(ln)
                 blk["x0"], blk["x1"] = min(blk["x0"], x0), max(blk["x1"], x1)
                 placed = True
