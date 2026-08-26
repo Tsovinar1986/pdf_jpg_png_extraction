@@ -5,10 +5,11 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        ink: "#0f1220",
-        accent: "#7c6cff",
-        accent2: "#37d6c4",
-        danger: "#ff6b6b",
+        paper: "#f6f1e7",
+        ink: "#181310",
+        accent: "#c2542d",
+        accent2: "#3f6259",
+        danger: "#c9463a",
       },
     },
   },

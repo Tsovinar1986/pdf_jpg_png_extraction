@@ -16,6 +16,7 @@ const normalizedPreviewBox = document.getElementById("normalizedPreviewBox");
 const normalizedPreviewImg = document.getElementById("normalizedPreviewImg");
 const normalizedPreviewLink = document.getElementById("normalizedPreviewLink");
 const copyBtn = document.getElementById("copyBtn");
+const copyBtnLabel = document.getElementById("copyBtnLabel");
 const downloadBtn = document.getElementById("downloadBtn");
 const downloadForm = document.getElementById("downloadForm");
 const downloadTextInput = document.getElementById("downloadTextInput");
@@ -200,9 +201,9 @@ copyBtn.addEventListener("click", async () => {
   if (!resultText.value) return;
   try {
     await navigator.clipboard.writeText(resultText.value);
-    const original = copyBtn.textContent;
-    copyBtn.textContent = "Copied ✓";
-    setTimeout(() => (copyBtn.textContent = original), 1500);
+    const original = copyBtnLabel.textContent;
+    copyBtnLabel.textContent = "Copied ✓";
+    setTimeout(() => (copyBtnLabel.textContent = original), 1500);
   } catch {
     resultText.select();
     document.execCommand("copy");

@@ -78,7 +78,7 @@
     height: 10px;
   }
   ::-webkit-scrollbar-thumb {
-    background: rgba(124, 108, 255, 0.35);
+    background: rgba(194, 84, 45, 0.35);
     border-radius: 999px;
   }
 }

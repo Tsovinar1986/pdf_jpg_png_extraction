@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF / Image Text Extractor</title>
+<title>Scanline &mdash; Text Extractor</title>
 <link rel="stylesheet" href="style.css">
 </head>
-<body class="min-h-screen relative flex items-center justify-center overflow-x-hidden p-4 py-8 font-sans text-slate-800 bg-slate-100 dark:text-slate-100 dark:bg-[#0f1220]">
+<body class="min-h-screen relative flex items-center justify-center overflow-x-hidden p-4 py-8 font-sans text-slate-800 bg-paper dark:text-slate-100 dark:bg-ink">
 
   <div class="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
     <div class="animate-blob-drift absolute -top-28 -left-24 h-[420px] w-[420px] rounded-full bg-accent opacity-20 blur-[110px] dark:opacity-35"></div>
@@ -40,18 +40,28 @@
     <span class="animate-glyph-float absolute bottom-0 text-lg font-semibold text-accent2/25 dark:text-accent2/35" style="left:56%;animation-duration:13s;animation-delay:-8s">Գ</span>
   </div>
 
-  <main class="relative z-10 w-full max-w-xl rounded-3xl border border-black/10 bg-white/80 p-8 shadow-2xl shadow-slate-900/10 backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.06] dark:shadow-black/40">
+  <main class="relative z-10 w-full max-w-xl rounded-3xl border border-black/10 bg-[#fffaf3]/85 p-8 shadow-2xl shadow-slate-900/10 backdrop-blur-xl dark:border-white/10 dark:bg-[#251d16]/60 dark:shadow-black/40">
 
     <header class="mb-7 text-center">
-      <div class="mb-2 text-4xl leading-none">📄</div>
-      <h1 class="mb-2 bg-gradient-to-r from-accent to-accent2 bg-clip-text text-2xl font-bold text-transparent">Text Extractor</h1>
-      <p class="text-sm leading-relaxed text-slate-500 dark:text-slate-400">Upload a PDF, image, spreadsheet, or document &mdash; get the extracted text in seconds</p>
+      <div class="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent/10 text-accent dark:bg-accent/15 dark:text-accent">
+        <svg viewBox="0 0 24 24" fill="none" class="h-6 w-6" aria-hidden="true">
+          <rect x="4.5" y="3" width="15" height="18" rx="2" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M8 8.5h8M8 12h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M4.5 15.5h15" stroke="#3f6259" class="dark:opacity-90" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <h1 class="mb-1.5 bg-gradient-to-r from-accent to-accent2 bg-clip-text text-2xl font-bold tracking-tight text-transparent">Scanline</h1>
+      <p class="mb-2.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-accent2 dark:text-accent2/80">Multilingual OCR &amp; text extraction</p>
+      <p class="text-sm leading-relaxed text-slate-500 dark:text-slate-400">Upload a PDF, image, spreadsheet, or document &mdash; get the extracted text in seconds.</p>
     </header>
 
     <label id="dropzone" for="fileInput"
-      class="group flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-2xl border-2 border-dashed border-slate-300 px-5 py-8 text-center transition hover:border-accent hover:bg-accent/5 dark:border-white/20 dark:hover:bg-accent/10 [&.dragover]:scale-[1.01] [&.dragover]:border-accent2 [&.dragover]:bg-accent2/10">
+      class="group flex cursor-pointer flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-300 px-5 py-8 text-center transition hover:border-accent hover:bg-accent/5 dark:border-white/20 dark:hover:bg-accent/10 [&.dragover]:scale-[1.01] [&.dragover]:border-accent2 [&.dragover]:bg-accent2/10">
       <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.gif,.webp,.heic,.heif,.xlsx,.xlsm,.docx,.csv,.txt,application/pdf,image/*,image/heic,image/heif" hidden>
-      <div class="text-2xl transition-transform group-hover:-translate-y-0.5">⬆️</div>
+      <svg viewBox="0 0 24 24" fill="none" class="h-6 w-6 text-slate-400 transition-transform group-hover:-translate-y-0.5 group-hover:text-accent" aria-hidden="true">
+        <path d="M12 16V4m0 0-4 4m4-4 4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 16v2.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
       <div class="text-[15px] text-slate-700 dark:text-slate-100">
         <strong>Click to select</strong> or drag a file here
       </div>
@@ -59,15 +69,22 @@
     </label>
 
     <div id="fileInfo" class="hidden mt-3.5 flex items-center gap-2.5 rounded-xl border border-black/10 bg-black/5 px-3.5 py-2.5 text-sm dark:border-white/10 dark:bg-white/5">
-      <span>📄</span>
+      <svg viewBox="0 0 24 24" fill="none" class="h-4 w-4 flex-shrink-0 text-accent2" aria-hidden="true">
+        <rect x="4.5" y="3" width="15" height="18" rx="2" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M8 8.5h8M8 12h8M8 15.5h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
       <span id="fileName" class="flex-1 truncate"></span>
       <button id="clearFile" type="button" aria-label="Remove file"
-        class="rounded-md p-1 text-slate-400 transition hover:bg-danger/10 hover:text-danger">✕</button>
+        class="rounded-md p-1 text-slate-400 transition hover:bg-danger/10 hover:text-danger">
+        <svg viewBox="0 0 24 24" fill="none" class="h-4 w-4" aria-hidden="true">
+          <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+      </button>
     </div>
 
     <div class="mt-[18px] flex justify-center">
       <button id="submitBtn" type="button" disabled
-        class="min-w-[220px] rounded-xl bg-gradient-to-r from-accent to-accent2 px-5 py-3 text-[15px] font-semibold text-white transition enabled:hover:-translate-y-0.5 enabled:hover:shadow-lg enabled:hover:shadow-accent/30 disabled:cursor-not-allowed disabled:opacity-40">
+        class="min-w-[220px] rounded-xl bg-accent px-5 py-3 text-[15px] font-semibold text-white transition enabled:hover:-translate-y-0.5 enabled:hover:bg-[#a8431f] enabled:hover:shadow-lg enabled:hover:shadow-accent/30 disabled:cursor-not-allowed disabled:opacity-40">
         <span id="submitLabel">Extract text</span>
       </button>
     </div>
@@ -93,7 +110,7 @@
           <button id="downloadDocxBtn" type="button"
             class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10">Download .docx</button>
           <button id="copyBtn" type="button"
-            class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10">Copy</button>
+            class="rounded-lg border border-black/10 bg-black/5 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-black/10 dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:hover:bg-white/10"><span id="copyBtnLabel">Copy</span></button>
         </div>
       </div>
       <img id="resultImagePreview" class="hidden mb-2.5 block max-h-56 w-full rounded-xl border border-black/10 bg-black/5 object-contain dark:border-white/10 dark:bg-black/25" alt="Uploaded image preview">
