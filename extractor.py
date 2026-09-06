@@ -230,21 +230,39 @@ _WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 # rack up a higher confidence-weighted score than the real (shorter,
 # less certain) text elsewhere in a busy image and win the "best of"
 # comparison outright.
-_REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}")
+#
+# Deliberately excludes digits (\D, not `.`): a repeated *digit* is
+# completely ordinary in real numbers — prices ("1000"), quantities
+# ("999"), years, phone numbers, zip codes, IDs — and this filter used to
+# nuke every one of them as if they were decorative noise, in every
+# language, since a number is a number regardless of the surrounding
+# script.
+_REPEATED_CHAR_RE = re.compile(r"(\D)\1{2,}")
 
 _HAS_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 
 
 def _looks_like_text(word: str) -> bool:
     """A bare stroke, edge, or blob in a graphic/illustration routinely
-    gets misread as a single digit or punctuation mark ("1", "|", ".",
-    ":") — plausible-looking, sometimes even high-confidence, but not
-    text. Requiring at least one real letter (or, for legitimate
-    all-digit content like a page number or a year, at least 2
-    characters) filters those isolated fragments out without rejecting
-    genuine short numbers.
+    gets misread as a single punctuation mark ("|", ".", ":") —
+    plausible-looking, sometimes even high-confidence, but not text.
+    Requiring at least one real letter (or, for legitimate short numeric
+    content, at least 2 characters — or exactly 1 digit) filters those
+    isolated punctuation fragments out without rejecting genuine short
+    numbers.
+
+    A lone digit ("Page 5", a single-digit table cell, a list index) is
+    let through here rather than blanket-rejected: unlike a stroke
+    misread as bare punctuation, it's real, common content in every
+    language this app targets, and it isn't trusted unconditionally —
+    anything that slips through as noise still has to clear the
+    confidence + cross-rendering-support corroboration bar downstream
+    (see _MIN_TRUSTED_SUPPORT/_MIN_TRUSTED_CONFIDENCE) like every other
+    borderline detection.
     """
     if _HAS_LETTER_RE.search(word):
+        return True
+    if len(word) == 1 and word.isdigit():
         return True
     return len(word) >= 2
 
@@ -290,8 +308,9 @@ def _strip_ocr_noise_marks(text: str) -> str:
 
 def _strip_standalone_punctuation_tokens(text: str) -> str:
     """Drop whole word-tokens that consist entirely of punctuation/symbol
-    characters (zero real letters) — a stray apostrophe, Armenian comma
-    ("՝"), or quote mark sitting by itself with real words on either side.
+    characters (zero real letters AND zero digits) — a stray apostrophe,
+    Armenian comma ("՝"), or quote mark sitting by itself with real words
+    on either side.
 
     Punctuation *attached* to a real word (a trailing period, a leading
     quote before a real word) is left alone — those can be genuine, and a
@@ -299,19 +318,26 @@ def _strip_standalone_punctuation_tokens(text: str) -> str:
     checked on a real scanned page, a short low-confidence leading
     fragment was sometimes a real (if incomplete) word, not noise, so
     confidence + length couldn't tell the two apart. But a token with no
-    letters in it at all can never be a real word in any language this
-    app targets, regardless of confidence — the same reasoning
-    _strip_ocr_noise_marks already applies to grave accents and vertical
-    bars, generalized to whatever other stray marks land as their own
-    isolated token (confirmed on that same page: every standalone
-    zero-letter token was noise — backtick, apostrophe, and "՝" alike).
+    letters *and no digits* in it at all can never be a real word in any
+    language this app targets, regardless of confidence — the same
+    reasoning _strip_ocr_noise_marks already applies to grave accents and
+    vertical bars, generalized to whatever other stray marks land as
+    their own isolated token (confirmed on that same page: every
+    standalone zero-letter, zero-digit token was noise — backtick,
+    apostrophe, and "՝" alike).
+
+    Checking isalnum() rather than isalpha() matters: a standalone
+    numeric token ("500", "2024", a table cell's bare quantity) has zero
+    *letters* but is very much real content, in every language this app
+    targets — an isalpha()-only check would delete it right alongside
+    genuine punctuation noise.
     """
     out_lines = []
     for line in text.split("\n"):
         if not line.strip():
             out_lines.append(line)
             continue
-        words = [w for w in line.split(" ") if any(ch.isalpha() for ch in w)]
+        words = [w for w in line.split(" ") if any(ch.isalnum() for ch in w)]
         out_lines.append(" ".join(words))
     return "\n".join(out_lines)
 
@@ -1174,6 +1200,15 @@ def _drop_line_edge_outliers(words: list) -> list:
     letter (there's not enough coherent shape in a decorative swirl for
     Tesseract to produce more), so the bar is 1, not 2 — narrow enough to
     leave real two-letter words alone.
+
+    Counting alnum characters, not just alpha: a decorative swirl has no
+    more coherent shape to become a multi-digit number than a multi-letter
+    word, so a pure-number token (a price, a quantity, a year) at a line's
+    edge is exactly as genuine as a multi-letter word there and must clear
+    the same length bar — counting only letters gave every such number 0
+    "letters" regardless of how many digits it actually had, silently
+    reclassifying real numbers of any length as one-character flourish
+    debris and dropping them off the ends of lines.
     """
     if len(words) < _EDGE_OUTLIER_MIN_NEIGHBORS + 1:
         return words
@@ -1182,9 +1217,9 @@ def _drop_line_edge_outliers(words: list) -> list:
     median_conf = core_confs[len(core_confs) // 2]
 
     def is_outlier(word: tuple) -> bool:
-        letters = sum(1 for ch in word[1] if ch.isalpha())
+        chars = sum(1 for ch in word[1] if ch.isalnum())
         return (
-            letters <= 1
+            chars <= 1
             and word[2] < _EDGE_OUTLIER_MAX_CONF
             and median_conf - word[2] >= _EDGE_OUTLIER_MIN_GAP
         )
