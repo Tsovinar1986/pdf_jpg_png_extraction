@@ -10,6 +10,7 @@ Features:
 - For image files, run OCR via pytesseract.
 """
 import argparse
+import base64
 import io
 import os
 import re
@@ -89,6 +90,15 @@ except Exception:
     _craft_load_model = None
 
 try:
+    # Optional: vision-model fallback (see _vision_ocr_fallback) for text
+    # Tesseract's trained character-shape models can't read at all —
+    # mainly decorative/calligraphic fonts. Not a hard dependency: off
+    # unless ANTHROPIC_API_KEY is set, see requirements.txt/README.
+    import anthropic
+except Exception:
+    anthropic = None
+
+try:
     import openpyxl
 except Exception:
     openpyxl = None
@@ -126,6 +136,22 @@ DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
 # On Windows, poppler (pdftoppm/pdftocairo) usually isn't on PATH unless
 # manually added; point pdf2image at its bin/ folder via this env var.
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
+
+# Model used for the vision-OCR fallback (see _vision_ocr_fallback) —
+# overridable since a harder image may be worth paying for a stronger
+# model on (e.g. VISION_FALLBACK_MODEL=claude-opus-5).
+VISION_FALLBACK_MODEL = os.getenv("VISION_FALLBACK_MODEL", "claude-sonnet-5")
+
+# Below this many non-whitespace characters, Tesseract's own reading is
+# treated as an effective failure worth paying for a vision-model retry —
+# not "zero characters", since a real failure on a stylized/decorative
+# image (see _vision_ocr_fallback) still typically produces a couple of
+# short garbled fragments rather than a perfectly empty string. Applied
+# to raw character count rather than _word_count's letter-sequence count
+# so a genuinely numbers-heavy real document (an invoice, a table of
+# figures) doesn't look "empty" and trigger a needless paid API call
+# just because it has few 3+-letter words.
+_VISION_FALLBACK_MIN_CHARS = 6
 
 
 def _installed_ocr_langs() -> Optional[set]:
@@ -1979,6 +2005,97 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     return _append_sidebar_text(text, sidebar_results)
 
 
+_vision_client = None
+_vision_client_tried = False
+
+
+def _get_vision_client():
+    """Lazily create and cache the Anthropic API client for the vision-OCR
+    fallback. Same two-state caching as _get_doclayout_model/_get_craft_model:
+    None is also the legitimate "not configured" outcome (no ANTHROPIC_API_KEY,
+    or the anthropic package isn't installed), so a separate "tried" flag
+    stops every single image from re-attempting client construction.
+    """
+    global _vision_client, _vision_client_tried
+    if _vision_client_tried:
+        return _vision_client
+    _vision_client_tried = True
+
+    if anthropic is None or not os.getenv("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        _vision_client = anthropic.Anthropic()
+    except Exception:
+        _vision_client = None
+    return _vision_client
+
+
+_VISION_OCR_PROMPT = (
+    "Transcribe every piece of visible text in this image exactly as written, "
+    "in its original language and script. Do not translate it, do not "
+    "summarize it, and do not add any commentary of your own — output only "
+    "the transcribed text. Preserve line breaks between separate lines or "
+    "blocks of text as they appear in the image. This image may contain "
+    "stylized, decorative, or calligraphic lettering that a plain character-"
+    "recognition engine would fail to read — read it the way a person would, "
+    "by recognizing the overall word/letter shapes, not by matching each "
+    "glyph to a standard printed letterform. If the image genuinely has no "
+    "legible text at all, reply with nothing."
+)
+
+
+def _vision_ocr_fallback(img: "Image.Image") -> Optional[str]:
+    """Best-effort: read text that Tesseract's own trained character-shape
+    models failed to recognize at all — confirmed necessary on a real
+    holiday-card image where a decorative calligraphic Armenian font came
+    back from the full Tesseract pipeline as a couple of garbled fragments
+    ("По", "Վ") instead of the three real lines of greeting text, no matter
+    how the image was preprocessed: the model has simply never seen
+    letterforms stylized that far from standard print, so no amount of
+    threshold/contrast tuning on this app's side can fix it. A vision-
+    capable LLM reads the image holistically the way a person would, rather
+    than matching individual glyphs against a fixed trained shape set, so
+    it isn't limited by that in the same way.
+
+    Deliberately opt-in and narrow-scoped rather than a general replacement
+    for Tesseract: it costs a real network call to a paid third-party API
+    and sends the image content there, so it only ever runs when (a) the
+    operator has explicitly enabled it by setting ANTHROPIC_API_KEY, and
+    (b) Tesseract's own reading came back empty or too sparse to trust (see
+    _VISION_FALLBACK_MIN_CHARS) — never on an already-successful extraction.
+
+    Returns None on any failure (not configured, missing package, network/
+    API error) — this is a bonus recovery path the rest of the pipeline
+    never depends on, matching every other optional enhancement in this
+    file (DocLayout-YOLO masking, CRAFT detection, rotated-sidebar
+    recovery).
+    """
+    client = _get_vision_client()
+    if client is None:
+        return None
+    try:
+        b64 = base64.b64encode(_to_png_bytes(img.convert("RGB"))).decode("ascii")
+        response = client.messages.create(
+            model=VISION_FALLBACK_MODEL,
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                    {"type": "text", "text": _VISION_OCR_PROMPT},
+                ],
+            }],
+        )
+        text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def _is_effectively_empty(text: str) -> bool:
+    return len(re.sub(r"\s+", "", text)) < _VISION_FALLBACK_MIN_CHARS
+
+
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # First try to extract text directly (for digitally generated PDFs)
     if pdf_extract_text is not None:
@@ -2008,6 +2125,10 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
         # only deskew needs to happen first, here.
         page = _deskew(page)
         txt = _ocr_best_of(page, lang)
+        if _is_effectively_empty(txt):
+            vision_txt = _vision_ocr_fallback(page)
+            if vision_txt:
+                txt = vision_txt
         out_lines.append(f"\n--- PAGE {i} ---\n")
         out_lines.append(txt)
     return "\n".join(out_lines)
@@ -2022,12 +2143,24 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     lang = _resolve_ocr_langs(lang)
     with Image.open(path) as img:
         img = _deskew(img)
-        return _ocr_best_of(img, lang)
+        text = _ocr_best_of(img, lang)
+        if _is_effectively_empty(text):
+            vision_text = _vision_ocr_fallback(img)
+            if vision_text:
+                return vision_text
+        return text
+
+
+# Below this, no single tone dominates the image widely enough to trust
+# the "majority pixel value = background" assumption normalize_dark_
+# image_to_paper's inversion depends on — see its docstring.
+_PAPER_NORMALIZE_MIN_DOMINANT_BAND = 0.45
 
 
 def normalize_dark_image_to_paper(img: "Image.Image") -> Optional["Image.Image"]:
-    """If the image looks like light text on a dark background, convert it
-    to a normal-looking scanned-paper style: white background, black text.
+    """If the image looks like light text on a dark, genuinely flat
+    background, convert it to a normal-looking scanned-paper style: white
+    background, black text.
 
     Dark-mode screenshots and dark poster/flyer designs are readable to a
     person but visually the inverse of a normal document; producing a
@@ -2035,6 +2168,32 @@ def normalize_dark_image_to_paper(img: "Image.Image") -> Optional["Image.Image"]
     that looks like what people expect a "cleaned up" text image to look
     like. Returns None if the image isn't dark-background to begin with
     (nothing to normalize) or if Pillow isn't installed.
+
+    Also returns None — deliberately, rather than inverting anyway — when
+    the image has no single tone covering enough of it to trust as "the
+    background" in the first place. The inversion below decides which side
+    of Otsu's cutoff is background purely by pixel count ("whichever value
+    covers more pixels"), which only holds for what this was built for: a
+    screenshot or poster where one flat color genuinely dominates and
+    sparse text sits on top of it. A real photograph has no such flat
+    background at all — every pixel belongs to some part of the photo — so
+    that pixel-count comparison instead measures "which tonal range this
+    particular photo happens to have slightly more of," and confidently
+    inverts on that basis anyway. Confirmed on a real case: a photo of a
+    candle with decorative text over a dark, textured bokeh background
+    (mean brightness 76, clearly "dark" by the check above) had dark
+    background pixels outnumbering the bright candle+text pixels only
+    because the background happened to fill slightly more of the frame —
+    not because it was a flat color sparse text sat on. Inverting on that
+    basis turned the candle itself (the photo's actual brightest, largest
+    subject) into a solid black blob, not a "cleaned up" version of
+    anything. A genuine flat-background screenshot has the large majority
+    of its pixels within a narrow band around its single dominant tone
+    (confirmed on a synthetic dark-mode chat screenshot: ~53% of pixels
+    fall within +-10 of the modal tone); the candle photo's pixels are
+    spread thinly across the tonal range instead (~38% in the same band
+    around its own mode) with no comparable single dominant tone to
+    justify calling either side of a cutoff "the background".
     """
     if Image is None or ImageOps is None or ImageStat is None:
         return None
@@ -2042,6 +2201,15 @@ def normalize_dark_image_to_paper(img: "Image.Image") -> Optional["Image.Image"]
     gray = ImageOps.grayscale(img.convert("RGB"))
     if ImageStat.Stat(gray).mean[0] >= 127:
         return None  # already a light background
+
+    hist = gray.histogram()
+    total = sum(hist)
+    if total == 0:
+        return None
+    mode_idx = hist.index(max(hist))
+    dominant_band = sum(hist[max(0, mode_idx - 10):mode_idx + 11])
+    if dominant_band / total < _PAPER_NORMALIZE_MIN_DOMINANT_BAND:
+        return None  # no tone dominant enough to trust as "the background"
 
     threshold = _otsu_threshold(gray)
     binarized = gray.point(lambda p: 255 if p > threshold else 0)
@@ -2051,8 +2219,8 @@ def normalize_dark_image_to_paper(img: "Image.Image") -> Optional["Image.Image"]
     # background, and normalize so background is always white (255) and
     # text is always black (0), regardless of the source's original
     # polarity or color.
-    hist = binarized.histogram()
-    if hist[0] > hist[255]:
+    bin_hist = binarized.histogram()
+    if bin_hist[0] > bin_hist[255]:
         binarized = ImageOps.invert(binarized)
 
     return binarized.convert("RGB")

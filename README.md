@@ -11,6 +11,7 @@ Features
 - Extract embedded images out of a PDF/XLSX/DOCX, or the image itself for a plain image upload, as downloadable PNGs.
 - Web UI (FastAPI backend + static frontend) with drag-and-drop upload, extracted-text panel, and an image gallery.
 - Optional: a trained document-layout model (DocLayout-YOLO) can pre-filter out illustration/table regions before OCR — off by default, see [Optional: DocLayout-YOLO pre-filter](#optional-doclayout-yolo-pre-filter-agpl-30) below.
+- Optional: a vision-model fallback reads decorative/calligraphic text Tesseract's trained character-shape model can't recognize at all — off by default, see [Optional: vision-model fallback](#optional-vision-model-fallback-for-text-tesseract-cant-read) below.
 
 Installation
 ------------
@@ -103,6 +104,22 @@ pip install -r requirements.txt -r requirements-craft.txt
 Shares `torch`/`torchvision` with `requirements-doclayout.txt` if both are installed — pip won't reinstall a satisfied requirement. The ~83MB checkpoint auto-downloads from Hugging Face on first use (cached in `~/.cache/huggingface`); for a manually-downloaded checkpoint instead, set `CRAFT_MODEL_PATH=/path/to/craft_mlt_25k.pth`.
 
 Only applies to short/scattered (poster-style) images, not normal paragraph text — that's where it was validated, and it costs a real extra detection pass plus per-region OCR that isn't worth paying on every ordinary page.
+
+### Optional: vision-model fallback for text Tesseract can't read
+
+Tesseract recognizes text by matching character shapes against a trained model of standard printed letterforms. Decorative/calligraphic fonts (e.g. a stylized holiday-card greeting) fall well outside that trained shape set — no amount of image preprocessing fixes it, because the model has simply never seen letters drawn that way. When enabled, this fallback sends the image to a vision-capable Claude model to read instead, but **only** when Tesseract's own reading for that page/image came back empty or reduced to a couple of garbled fragments — never on a normal, already-successful extraction.
+
+**Off by default** — extraction works exactly the same without it, no error, no behavior change. To enable it:
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...   # from https://console.anthropic.com/
+```
+
+Get your own key from the Anthropic Console; don't share it or commit it anywhere. `anthropic` is already in `requirements.txt`, so no extra install step is needed once the key is set.
+
+> **Cost & privacy note**: unlike every other feature in this app, this one makes a real network call to a third-party paid API and sends the image's pixel content there. It's scoped to only fire on pages Tesseract essentially failed on, but if you're processing sensitive documents or want to avoid any external network calls, leave `ANTHROPIC_API_KEY` unset.
+
+Override the model with `VISION_FALLBACK_MODEL` (default `claude-sonnet-5`) — e.g. set it to `claude-opus-5` for a harder image if the default doesn't read it correctly.
 
 ### Automatic: deskew
 
