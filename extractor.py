@@ -10,7 +10,6 @@ Features:
 - For image files, run OCR via pytesseract.
 """
 import argparse
-import base64
 import io
 import os
 import re
@@ -90,15 +89,6 @@ except Exception:
     _craft_load_model = None
 
 try:
-    # Optional: vision-model fallback (see _vision_ocr_fallback) for text
-    # Tesseract's trained character-shape models can't read at all —
-    # mainly decorative/calligraphic fonts. Not a hard dependency: off
-    # unless ANTHROPIC_API_KEY is set, see requirements.txt/README.
-    import anthropic
-except Exception:
-    anthropic = None
-
-try:
     import openpyxl
 except Exception:
     openpyxl = None
@@ -136,22 +126,6 @@ DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "hye+rus+eng")
 # On Windows, poppler (pdftoppm/pdftocairo) usually isn't on PATH unless
 # manually added; point pdf2image at its bin/ folder via this env var.
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
-
-# Model used for the vision-OCR fallback (see _vision_ocr_fallback) —
-# overridable since a harder image may be worth paying for a stronger
-# model on (e.g. VISION_FALLBACK_MODEL=claude-opus-5).
-VISION_FALLBACK_MODEL = os.getenv("VISION_FALLBACK_MODEL", "claude-sonnet-5")
-
-# Below this many non-whitespace characters, Tesseract's own reading is
-# treated as an effective failure worth paying for a vision-model retry —
-# not "zero characters", since a real failure on a stylized/decorative
-# image (see _vision_ocr_fallback) still typically produces a couple of
-# short garbled fragments rather than a perfectly empty string. Applied
-# to raw character count rather than _word_count's letter-sequence count
-# so a genuinely numbers-heavy real document (an invoice, a table of
-# figures) doesn't look "empty" and trigger a needless paid API call
-# just because it has few 3+-letter words.
-_VISION_FALLBACK_MIN_CHARS = 6
 
 
 def _installed_ocr_langs() -> Optional[set]:
@@ -1537,6 +1511,87 @@ def _rotation_makes_ocr_worse(original: "Image.Image", rotated: "Image.Image") -
     return _mean_word_confidence(rot_data) < _mean_word_confidence(orig_data)
 
 
+# Minimum fraction of the page a connected block of otherwise-undetected
+# ink/color content must cover to be treated as a probable illustration
+# DocLayout-YOLO missed entirely (see _find_undetected_visual_regions) —
+# small enough to catch a real illustration, large enough to leave a
+# page's individual colored words/highlights alone.
+_UNDETECTED_VISUAL_MIN_AREA_FRACTION = 0.03
+
+
+def _find_undetected_visual_regions(rgb: "Image.Image", known_boxes: List[tuple]) -> List[tuple]:
+    """Find large connected blocks of non-background content that
+    DocLayout-YOLO didn't put a box around at all — not "figure", not
+    "plain_text", nothing.
+
+    DocLayout-YOLO is trained on scientific-paper-style layouts (see the
+    README); confirmed on a real children's-book page that it can produce
+    zero detections of *any* class over a colorful illustration, not just
+    a wrong or low-confidence one — so _mask_layout_noise's own class-
+    based masking never even considers that region, and the illustration's
+    raw pixels go straight into Tesseract, which hallucinated a wall of
+    garbage from it (dozens of nonsense "words" on that real page). This
+    catches that case directly: a large blob of ink/color the model didn't
+    account for at all is proposed as a mask candidate exactly like an
+    explicit "figure" detection would be, so it inherits every one of
+    _mask_layout_noise's existing safety checks (real-text-overlap,
+    per-box and aggregate page-area caps) once merged into its candidate
+    list — this function only ever proposes candidates, it never decides
+    to mask on its own.
+
+    Known (DocLayout-detected) box pixels are zeroed out of the
+    non-background mask *before* dilation/connected-components, not
+    filtered out afterwards. That ordering matters: a real illustration
+    can sit close enough below a real text column that dilating first and
+    checking overlap after lets the two get bridged into a single blob
+    covering both — confirmed on that same real page, where a right-
+    column text box ended up 100% enclosed inside one such merged blob,
+    and an after-the-fact "is this candidate mostly known content"
+    area-ratio check missed it (the merged blob was only ~29% known-box
+    area overall, comfortably under any reasonable threshold, even though
+    it fully swallowed a real text box). Removing known-box pixels first
+    means dilation has no real text pixels left to bridge through, so an
+    illustration below a text column stays its own separate component
+    regardless of how close the two sit.
+    """
+    gray = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2GRAY)
+    non_bg = (gray < 245).astype("uint8")
+
+    h, w = non_bg.shape
+    # Padded, not exact: DocLayout-YOLO's own box edges are an estimate,
+    # not a pixel-perfect crop — confirmed on the same real page, where
+    # the right column's last line sat just outside its detected "plain
+    # text" box's bottom edge, close enough to an illustration below it
+    # that dilation still pulled that line's leftover pixels into the
+    # illustration's blob and got it masked away with it. A margin here
+    # keeps a real text box's *edge* out of the "unknown" pool the blob
+    # detector draws from, on top of (not instead of) the exact-box
+    # exclusion — this is what actually stops that specific leak; the
+    # exact box alone wasn't enough.
+    pad = 15
+    known_mask = np.zeros(non_bg.shape, dtype=bool)
+    for kx0, ky0, kx1, ky1 in known_boxes:
+        known_mask[max(0, ky0 - pad):min(h, ky1 + pad), max(0, kx0 - pad):min(w, kx1 + pad)] = True
+    non_bg[known_mask] = 0
+
+    # Bridge an illustration's internal gaps (a white sky/water patch
+    # between solid-color shapes) into one connected blob — the same
+    # dilate-then-connect approach _recover_rotated_sidebar_text uses for
+    # the analogous "find a real block of content" problem.
+    dilated = cv2.dilate(non_bg, np.ones((25, 25), np.uint8), iterations=1)
+    num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+
+    page_area = rgb.width * rgb.height
+    min_area = page_area * _UNDETECTED_VISUAL_MIN_AREA_FRACTION
+    found = []
+    for i in range(1, num_labels):  # label 0 is background
+        x, y, w, h, area = stats[i]
+        if area < min_area:
+            continue
+        found.append((x, y, x + w, y + h))
+    return found
+
+
 def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
     """Best-effort: if DocLayout-YOLO is available, detect figure/table
     regions and mask them white before OCR, so illustration noise can't
@@ -1565,6 +1620,8 @@ def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
                 cls_name = names[int(box.cls[0])]
                 coords = tuple(int(v) for v in box.xyxy[0].tolist())
                 (mask_candidates if cls_name in _DOCLAYOUT_MASK_CLASSES else text_boxes).append(coords)
+
+        mask_candidates += _find_undetected_visual_regions(rgb, mask_candidates + text_boxes)
 
         def _overlaps_real_text(box: tuple) -> bool:
             x0, y0, x1, y1 = box
@@ -1614,6 +1671,28 @@ def _mask_layout_noise(img: "Image.Image") -> "Image.Image":
         mask = np.zeros(rgb.size[::-1], dtype=bool)
         for x0, y0, x1, y1 in boxes:
             mask[max(0, y0):y1, max(0, x0):x1] = True
+
+        # A hard floor beneath every check above, not a substitute for
+        # them: a text box's own rectangle can be geometrically close
+        # enough to real illustration content that they touch in the
+        # source image itself (confirmed on a real page: a sun graphic's
+        # thin rays extended up to physically touch the last line of an
+        # adjacent text column, with no gap at all to separate them by
+        # position), so a masked region's *rectangle* can legitimately
+        # overlap a text box's rectangle a little even after every prior
+        # box-level filter passes. Carving known text pixels back out of
+        # the final pixel mask, at the last possible moment before
+        # painting, is what actually guarantees real text next to a
+        # touching illustration never gets whitened — no rectangle-
+        # overlap threshold, however strict, can promise that on its own
+        # when the two are genuinely touching rather than merely close.
+        protected = np.zeros(rgb.size[::-1], dtype=bool)
+        h, w = protected.shape
+        pad = 15
+        for tx0, ty0, tx1, ty1 in text_boxes:
+            protected[max(0, ty0 - pad):min(h, ty1 + pad), max(0, tx0 - pad):min(w, tx1 + pad)] = True
+        mask[protected] = False
+
         if mask.sum() > page_area * 0.6:
             return img
 
@@ -2005,97 +2084,6 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     return _append_sidebar_text(text, sidebar_results)
 
 
-_vision_client = None
-_vision_client_tried = False
-
-
-def _get_vision_client():
-    """Lazily create and cache the Anthropic API client for the vision-OCR
-    fallback. Same two-state caching as _get_doclayout_model/_get_craft_model:
-    None is also the legitimate "not configured" outcome (no ANTHROPIC_API_KEY,
-    or the anthropic package isn't installed), so a separate "tried" flag
-    stops every single image from re-attempting client construction.
-    """
-    global _vision_client, _vision_client_tried
-    if _vision_client_tried:
-        return _vision_client
-    _vision_client_tried = True
-
-    if anthropic is None or not os.getenv("ANTHROPIC_API_KEY"):
-        return None
-    try:
-        _vision_client = anthropic.Anthropic()
-    except Exception:
-        _vision_client = None
-    return _vision_client
-
-
-_VISION_OCR_PROMPT = (
-    "Transcribe every piece of visible text in this image exactly as written, "
-    "in its original language and script. Do not translate it, do not "
-    "summarize it, and do not add any commentary of your own — output only "
-    "the transcribed text. Preserve line breaks between separate lines or "
-    "blocks of text as they appear in the image. This image may contain "
-    "stylized, decorative, or calligraphic lettering that a plain character-"
-    "recognition engine would fail to read — read it the way a person would, "
-    "by recognizing the overall word/letter shapes, not by matching each "
-    "glyph to a standard printed letterform. If the image genuinely has no "
-    "legible text at all, reply with nothing."
-)
-
-
-def _vision_ocr_fallback(img: "Image.Image") -> Optional[str]:
-    """Best-effort: read text that Tesseract's own trained character-shape
-    models failed to recognize at all — confirmed necessary on a real
-    holiday-card image where a decorative calligraphic Armenian font came
-    back from the full Tesseract pipeline as a couple of garbled fragments
-    ("По", "Վ") instead of the three real lines of greeting text, no matter
-    how the image was preprocessed: the model has simply never seen
-    letterforms stylized that far from standard print, so no amount of
-    threshold/contrast tuning on this app's side can fix it. A vision-
-    capable LLM reads the image holistically the way a person would, rather
-    than matching individual glyphs against a fixed trained shape set, so
-    it isn't limited by that in the same way.
-
-    Deliberately opt-in and narrow-scoped rather than a general replacement
-    for Tesseract: it costs a real network call to a paid third-party API
-    and sends the image content there, so it only ever runs when (a) the
-    operator has explicitly enabled it by setting ANTHROPIC_API_KEY, and
-    (b) Tesseract's own reading came back empty or too sparse to trust (see
-    _VISION_FALLBACK_MIN_CHARS) — never on an already-successful extraction.
-
-    Returns None on any failure (not configured, missing package, network/
-    API error) — this is a bonus recovery path the rest of the pipeline
-    never depends on, matching every other optional enhancement in this
-    file (DocLayout-YOLO masking, CRAFT detection, rotated-sidebar
-    recovery).
-    """
-    client = _get_vision_client()
-    if client is None:
-        return None
-    try:
-        b64 = base64.b64encode(_to_png_bytes(img.convert("RGB"))).decode("ascii")
-        response = client.messages.create(
-            model=VISION_FALLBACK_MODEL,
-            max_tokens=2048,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                    {"type": "text", "text": _VISION_OCR_PROMPT},
-                ],
-            }],
-        )
-        text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text").strip()
-        return text or None
-    except Exception:
-        return None
-
-
-def _is_effectively_empty(text: str) -> bool:
-    return len(re.sub(r"\s+", "", text)) < _VISION_FALLBACK_MIN_CHARS
-
-
 def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     # First try to extract text directly (for digitally generated PDFs)
     if pdf_extract_text is not None:
@@ -2125,10 +2113,6 @@ def extract_text_from_pdf(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
         # only deskew needs to happen first, here.
         page = _deskew(page)
         txt = _ocr_best_of(page, lang)
-        if _is_effectively_empty(txt):
-            vision_txt = _vision_ocr_fallback(page)
-            if vision_txt:
-                txt = vision_txt
         out_lines.append(f"\n--- PAGE {i} ---\n")
         out_lines.append(txt)
     return "\n".join(out_lines)
@@ -2143,12 +2127,7 @@ def extract_text_from_image(path: Path, lang: str = DEFAULT_OCR_LANGS) -> str:
     lang = _resolve_ocr_langs(lang)
     with Image.open(path) as img:
         img = _deskew(img)
-        text = _ocr_best_of(img, lang)
-        if _is_effectively_empty(text):
-            vision_text = _vision_ocr_fallback(img)
-            if vision_text:
-                return vision_text
-        return text
+        return _ocr_best_of(img, lang)
 
 
 # Below this, no single tone dominates the image widely enough to trust
