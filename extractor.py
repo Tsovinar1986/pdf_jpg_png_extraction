@@ -372,6 +372,26 @@ def _fix_standalone_yev_misread(text: str) -> str:
     return "\n".join(out_lines)
 
 
+def _expand_yev_ligature(text: str) -> str:
+    """Replace every "և" (the Armenian ech-yiwn ligature, U+0587) with its
+    two-letter spelling "եվ".
+
+    Requested directly: "և" is a single ligature glyph, distinct from a
+    plain two-character sequence, and it's exactly the kind of unusual
+    glyph shape that gives OCR (and some fonts/systems downstream of it)
+    trouble — the standalone-word misread _fix_standalone_yev_misread
+    corrects above is one concrete example of that. Expanding it to the
+    ordinary letters "ե" + "վ" it's pronounced as ("yev") sidesteps that
+    across the board: this runs after _fix_standalone_yev_misread, so a
+    "ն" this pipeline already corrected to "և" gets expanded too, not just
+    a "և" Tesseract happened to read correctly on its own. No uppercase
+    variant to handle: Armenian orthography has no capital ligature form —
+    a capitalized instance is already written as the two letters "Եվ", not
+    a distinct glyph.
+    """
+    return text.replace("և", "եվ")
+
+
 def _strip_stray_script_glyphs(text: str) -> str:
     """Drop short (<=2 char) word-tokens whose script doesn't match the
     rest of their line.
@@ -2063,6 +2083,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
         text = _strip_ocr_noise_marks(text)
         text = _strip_standalone_punctuation_tokens(text)
         text = _fix_standalone_yev_misread(text)
+        text = _expand_yev_ligature(text)
         return _append_sidebar_text(text, sidebar_results)
 
     detections = _collect_ocr_detections(raw_img, lang, min_conf=40)
@@ -2081,6 +2102,7 @@ def _ocr_best_of(raw_img: "Image.Image", lang: str) -> str:
     text = _strip_ocr_noise_marks(text)
     text = _strip_standalone_punctuation_tokens(text)
     text = _fix_standalone_yev_misread(text)
+    text = _expand_yev_ligature(text)
     return _append_sidebar_text(text, sidebar_results)
 
 
